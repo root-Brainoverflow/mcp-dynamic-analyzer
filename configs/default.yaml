@@ -1,0 +1,48 @@
+# MCP Dynamic Analyzer — Default analysis configuration
+
+server:
+  command: ""          # e.g. "npx", "python", "node"
+  args: []             # e.g. ["@modelcontextprotocol/server-filesystem", "/tmp"]
+  env: {}
+  transport: "stdio"   # "stdio" | "http"
+  http_port: null      # Required when transport=http
+
+sandbox:
+  memory_limit: "512m"
+  cpu_limit: 0.5
+  timeout: 300
+  network:
+    # "none" = no egress (npx/npm in Docker will fail). "allowlist" = Docker
+    # bridge only (not host network); npm registry reachable. Allowlist entries
+    # are prefixes for netmon event classification, not a kernel firewall.
+    mode: "allowlist"
+    allowlist: []
+    block_internal: true
+    log_all_traffic: true
+
+scanners:
+  r1_data_access:
+    enabled: true
+
+  r2_code_exec:
+    enabled: true
+
+  r3_llm_manipulation:
+    enabled: true
+    llm_api: null          # null = pattern-only, "anthropic" = LLM impact test
+
+  r4_behavior_drift:
+    enabled: true
+    repeat_count: 3
+    env_variations: 2
+
+  r5_input_validation:
+    enabled: true
+    fuzz_rounds: 10
+
+  r6_stability:
+    enabled: true
+    stress_duration: 30
+
+output:
+  output_dir: "./results"

@@ -1,0 +1,29 @@
+# MCP Dynamic Analyzer — Quick scan (R1 + R3 + R5 only, ~60 seconds)
+
+server:
+  command: ""
+  args: []
+  env: {}
+  transport: "stdio"
+  http_port: null
+
+sandbox:
+  memory_limit: "512m"
+  cpu_limit: 0.5
+  timeout: 60
+  network:
+    mode: "allowlist"
+    allowlist: []
+    block_internal: true
+    log_all_traffic: true
+
+scanners:
+  r1_data_access: { enabled: true }
+  r2_code_exec: { enabled: false }
+  r3_llm_manipulation: { enabled: true, llm_api: null }
+  r4_behavior_drift: { enabled: false }
+  r5_input_validation: { enabled: true, fuzz_rounds: 3 }
+  r6_stability: { enabled: false }
+
+output:
+  output_dir: "./results"

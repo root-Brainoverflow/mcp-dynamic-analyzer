@@ -1,0 +1,26 @@
+# Node 20+ required by many current MCP npm packages (e.g. chrome-devtools-mcp).
+# Ubuntu's apt nodejs was v18; use official Node image and add Python/strace on Debian.
+FROM node:22-bookworm-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3 python3-pip python3-venv \
+    strace \
+    inotify-tools \
+    curl \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip3 install --no-cache-dir --break-system-packages \
+    mcp \
+    fastmcp \
+    python-dotenv \
+    httpx \
+    aiofiles \
+    pydantic
+
+RUN useradd -m -s /bin/bash user
+
+WORKDIR /workspace
+USER user
+
+CMD ["sleep", "infinity"]
