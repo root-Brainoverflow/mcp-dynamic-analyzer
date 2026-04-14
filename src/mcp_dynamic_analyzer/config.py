@@ -61,6 +61,21 @@ class SandboxConfig(BaseModel):
     cpu_limit: float = 0.5
     timeout: int = 300
     network: NetworkConfig = Field(default_factory=NetworkConfig)
+    # "strict"    : read-only rootfs, no-new-privileges, minimal caps.
+    # "permissive": give the MCP server maximum freedom *inside* the sandbox
+    #               (writable rootfs, all caps, seccomp unconfined) while
+    #               still preventing host escape (no --privileged, no host
+    #               network, no host PID/IPC). Use when analysing public
+    #               registry servers whose requirements are unknown.
+    isolation: str = "strict"
+
+    @field_validator("isolation")
+    @classmethod
+    def _validate_isolation(cls, v: str) -> str:
+        if v not in ("strict", "permissive"):
+            msg = f"isolation must be 'strict' or 'permissive', got '{v}'"
+            raise ValueError(msg)
+        return v
 
 
 # ---------------------------------------------------------------------------

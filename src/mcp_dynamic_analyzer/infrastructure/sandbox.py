@@ -16,6 +16,10 @@ from typing import Any
 import structlog
 
 from mcp_dynamic_analyzer.config import SandboxConfig, ServerConfig
+from mcp_dynamic_analyzer.infrastructure.runtime_resolver import (
+    ResolvedRuntime,
+    RuntimeResolver,
+)
 
 log = structlog.get_logger()
 
@@ -58,19 +62,26 @@ class Sandbox:
         env_override: dict[str, str] | None = None,
         honeypot_dir: str | None = None,
         use_docker: bool = True,
+        runtime_resolver: RuntimeResolver | None = None,
     ) -> None:
         self._server = server_config
         self._sandbox = sandbox_config
         self._env_override = env_override
         self._honeypot_dir = honeypot_dir
         self._use_docker = use_docker
+        self._resolver = runtime_resolver or RuntimeResolver()
+        # Resolved lazily the first time we build a docker command so that
+        # local-mode sandboxes never touch the resolver.
+        self._resolved: ResolvedRuntime | None = None
         self._proc: asyncio.subprocess.Process | None = None
         # Unique container name assigned before docker run so SystemMonitor
         # can attach strace via ``docker exec <name> strace -p 1``.
         self._container_name: str = f"mcp-analyzer-{uuid.uuid4().hex[:12]}"
         # Host directory mounted as /workspace inside the container.
         # Defaults to CWD so that relative server script paths resolve correctly.
-        self._workspace_dir: str = str(Path.cwd())
+        # Resolved here so the host path is absolute and symlink-free before it
+        # ever reaches ``docker run -v``.
+        self._workspace_dir: str = str(Path.cwd().resolve())
 
     # -- public properties ---------------------------------------------------
 
@@ -226,40 +237,39 @@ class Sandbox:
             env.update(self._env_override)
         return env
 
-    def _docker_remap_cmd(self, cmd: str) -> str:
-        """Normalise a server command for use inside the mcp-sandbox container.
-
-        Handles three cases:
-        1. Bare name alias  : "python"  → "python3"
-        2. Host interpreter : "/Users/.../venv/bin/python3" → "python3"
-           (absolute path to a Python/Node binary that won't exist in the image)
-        3. Everything else  : returned unchanged
-        """
-        basename = Path(cmd).name  # works for both bare names and absolute paths
-        _aliases: dict[str, str] = {
-            "python": "python3",
-            "python3.10": "python3",
-            "python3.11": "python3",
-            "python3.12": "python3",
-            "python3.13": "python3",
-            "node": "node",
-            "nodejs": "node",
-        }
-        remapped = _aliases.get(basename, cmd if not Path(cmd).is_absolute() else basename)
-        if remapped != cmd:
+    def _resolve_runtime(self) -> ResolvedRuntime:
+        """Resolve and cache the runtime profile for this sandbox."""
+        if self._resolved is None:
+            self._resolved = self._resolver.resolve(self._server)
             log.info(
-                "sandbox.cmd_remapped",
-                original=cmd,
-                remapped=remapped,
-                reason="Host path or alias not available in mcp-sandbox image.",
+                "sandbox.runtime_resolved",
+                image=self._resolved.image,
+                command=self._resolved.command,
+                reason=self._resolved.reason,
             )
-        return remapped
+        return self._resolved
+
+    @staticmethod
+    def _host_mount_source(path: str) -> str:
+        """Normalise a host path for ``docker run -v``.
+
+        Docker Desktop accepts Windows drive-letter paths (``C:\\Users\\...``)
+        directly, but forward slashes are more portable across shells and the
+        Docker CLI also accepts them. We resolve to an absolute path and
+        forward-slash it so that the same Sandbox code runs unchanged on
+        macOS, Linux, and Windows hosts.
+        """
+        p = Path(path).resolve()
+        s = str(p)
+        # Windows: "C:\\foo\\bar" → "C:/foo/bar". No-op on POSIX.
+        return s.replace("\\", "/")
 
     def _build_docker_cmd(self) -> list[str]:
         sb = self._sandbox
         net = sb.network
 
-        server_cmd = self._docker_remap_cmd(self._server.command)
+        runtime = self._resolve_runtime()
+        server_cmd = runtime.command
 
         # Remap absolute-path args to container-internal paths and collect
         # extra volume mounts.  This handles --server-path /abs/path/server.py
@@ -269,7 +279,9 @@ class Sandbox:
         for arg in self._server.args:
             p = Path(arg)
             if p.is_absolute() and p.exists():
-                host_dir = str(p.parent)
+                # Normalise the host-side key so Windows paths don't collide
+                # with themselves under different slash conventions.
+                host_dir = self._host_mount_source(str(p.parent))
                 # Reuse the same container dir if already mounted.
                 if host_dir not in extra_mounts:
                     extra_mounts[host_dir] = f"/mcp-server-{len(extra_mounts)}"
@@ -290,11 +302,27 @@ class Sandbox:
             "--name", self._container_name,
             "--memory", sb.memory_limit,
             "--cpus", str(sb.cpu_limit),
-            "--read-only",
-            "--tmpfs", "/tmp:size=100m",
-            "--security-opt", "no-new-privileges",
-            "--cap-add", "SYS_PTRACE",
         ]
+
+        if sb.isolation == "strict":
+            # Locked-down default: writable state only in tmpfs /tmp, no
+            # privilege escalation, only SYS_PTRACE for strace attach.
+            cmd += [
+                "--read-only",
+                "--tmpfs", "/tmp:size=100m",
+                "--security-opt", "no-new-privileges",
+                "--cap-add", "SYS_PTRACE",
+            ]
+        else:
+            # Permissive: the MCP server can write anywhere in the container
+            # rootfs, call any syscall, and hold any capability — but host
+            # isolation primitives (user namespaces, rootless Docker config,
+            # no --privileged, no --network host, no host PID/IPC) stay on.
+            cmd += [
+                "--cap-add", "ALL",
+                "--security-opt", "seccomp=unconfined",
+                "--security-opt", "apparmor=unconfined",
+            ]
 
         if net.mode == "none":
             cmd += ["--network", "none"]
@@ -312,20 +340,27 @@ class Sandbox:
             # rw: npx/npm need to create ~/.npm under $HOME; many images use
             # /home/user as HOME.  RO caused ENOENT mkdir '/home/user/.npm'.
             # The host path is a per-session temp dir — still isolated from prod.
-            cmd += ["-v", f"{self._honeypot_dir}:/home/user:rw"]
+            honeypot_src = self._host_mount_source(self._honeypot_dir)
+            cmd += ["-v", f"{honeypot_src}:/home/user:rw"]
 
-        # CWD workspace: for relative paths like "python tests/fixtures/server.py"
-        cmd += ["-v", f"{self._workspace_dir}:/workspace:ro"]
+        # CWD workspace: for relative paths like "python tests/fixtures/server.py".
+        # Permissive mode mounts rw so servers that write sibling files (logs,
+        # caches) can do so; strict mode keeps it read-only.
+        ws_src = self._host_mount_source(self._workspace_dir)
+        ws_mode = "rw" if sb.isolation == "permissive" else "ro"
+        cmd += ["-v", f"{ws_src}:/workspace:{ws_mode}"]
         cmd += ["-w", "/workspace"]
 
-        # Extra mounts for absolute server paths outside the workspace
+        # Extra mounts for absolute server paths outside the workspace.
+        # Always read-only: the target file is source code under analysis and
+        # accidental writes there would corrupt the host project.
         for host_dir, container_dir in extra_mounts.items():
             cmd += ["-v", f"{host_dir}:{container_dir}:ro"]
 
         if self._server.transport == "http" and self._server.http_port:
             cmd += ["-p", f"127.0.0.1:{self._server.http_port}:{self._server.http_port}/tcp"]
 
-        cmd.append("mcp-sandbox")
+        cmd.append(runtime.image)
         cmd.append(server_cmd)
         cmd += remapped_args
 
