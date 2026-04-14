@@ -14,6 +14,16 @@ apt-get install -y --no-install-recommends \
     iproute2
 rm -rf /var/lib/apt/lists/*
 
-# Non-root analysis user. UID/GID 1000 matches typical host user on Linux; on
-# macOS/Windows Docker Desktop handles the mapping transparently.
-id -u user >/dev/null 2>&1 || useradd -m -s /bin/bash -u 1000 user
+# Non-root analysis user named 'user'. Official node/python base images
+# already ship a user at UID 1000 ('node', 'python', …); we rename that
+# one instead of creating a duplicate UID.
+if ! id -u user >/dev/null 2>&1; then
+    if id -u 1000 >/dev/null 2>&1; then
+        existing=$(id -nu 1000)
+        usermod -l user "$existing"
+        groupmod -n user "$existing" 2>/dev/null || true
+        usermod -d /home/user -m user 2>/dev/null || true
+    else
+        useradd -m -s /bin/bash -u 1000 user
+    fi
+fi
