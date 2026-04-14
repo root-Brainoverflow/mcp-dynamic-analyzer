@@ -12,6 +12,11 @@ from rich.console import Console
 from rich.table import Table
 
 from mcp_dynamic_analyzer.config import AnalysisConfig, load_config
+from mcp_dynamic_analyzer.discovery import (
+    DiscoveredServer,
+    discover_servers,
+    select_server,
+)
 from mcp_dynamic_analyzer.models import AnalysisOutput
 
 log = structlog.get_logger()
@@ -35,41 +40,46 @@ def main() -> None:
 # ---------------------------------------------------------------------------
 
 @main.command()
-@click.option("--server", default=None, help="Server command (e.g. 'npx @mcp/server /tmp')")
+def discover() -> None:
+    """List MCP servers already configured on this machine.
+
+    Scans Claude Desktop, Claude Code, Cursor, and VSCode config files.
+    Use the server name shown here with ``scan --target <name>``.
+    """
+    servers = discover_servers()
+    if not servers:
+        console.print(
+            "[yellow]No MCP servers found in any known config location.[/yellow]\n"
+            "Checked: claude-desktop, claude-code, cursor, vscode."
+        )
+        return
+    _print_discovered(servers)
+
+
+@main.command()
 @click.option(
-    "--server-path",
-    type=click.Path(exists=True, path_type=Path),
+    "--target",
+    required=True,
+    help="Name of a discovered MCP server (see `discover`)",
+)
+@click.option(
+    "--source",
     default=None,
-    help="Absolute path to MCP server entry file/binary",
-)
-@click.option(
-    "--server-runtime",
-    type=click.Choice(["auto", "python", "node", "exec"]),
-    default="auto",
-    show_default=True,
-    help="Runtime used with --server-path",
-)
-@click.option(
-    "--server-arg",
-    "server_args",
-    multiple=True,
-    help="Additional argument passed to --server-path server (repeatable)",
+    help="Restrict selection to one source (claude-desktop|claude-code|cursor|vscode)",
 )
 @click.option("--config", "config_path", type=click.Path(exists=True), default=None)
 @click.option("--quick", is_flag=True, help="Quick scan (R1 + R3 + R5 only)")
 @click.option("--format", "fmt", type=click.Choice(["json", "summary"]), default="summary")
 @click.option("--no-docker", is_flag=True, help="Run server locally without Docker")
 def scan(
-    server: str | None,
-    server_path: Path | None,
-    server_runtime: str,
-    server_args: tuple[str, ...],
+    target: str,
+    source: str | None,
     config_path: str | None,
     quick: bool,
     fmt: str,
     no_docker: bool,
 ) -> None:
-    """Run a full dynamic analysis on an MCP server."""
+    """Run a full dynamic analysis on a discovered MCP server."""
     if config_path:
         cfg = load_config(config_path)
     elif quick:
@@ -77,20 +87,27 @@ def scan(
     else:
         cfg = AnalysisConfig()
 
-    if server and server_path:
-        click.echo("Error: use either --server or --server-path, not both", err=True)
+    servers = discover_servers()
+    if not servers:
+        click.echo(
+            "Error: no MCP servers found. Run `mcp-dynamic-analyzer discover` "
+            "to see what's available, or configure one in Claude Desktop/Code first.",
+            err=True,
+        )
+        sys.exit(1)
+    try:
+        picked = select_server(servers, target, source)
+    except ValueError as exc:
+        click.echo(f"Error: {exc}", err=True)
         sys.exit(1)
 
-    if server:
-        parts = server.split()
-        cfg.server.command = parts[0]
-        cfg.server.args = parts[1:]
-    elif server_path:
-        _configure_server_from_path(cfg, server_path, server_runtime, list(server_args))
-
-    if not cfg.server.command:
-        click.echo("Error: --server, --server-path, or --config required", err=True)
-        sys.exit(1)
+    # Pydantic models are immutable-by-convention here; replace the whole
+    # server block with the discovered config so all fields transfer cleanly.
+    cfg.server = picked.server
+    console.print(
+        f"[green]Target:[/green] {picked.name}  "
+        f"[dim]({picked.source} — {picked.source_path})[/dim]"
+    )
 
     from mcp_dynamic_analyzer.orchestrator import run_analysis, build_default_scanners
 
@@ -104,37 +121,24 @@ def scan(
         _print_summary(output)
 
 
-def _configure_server_from_path(
-    cfg: AnalysisConfig,
-    server_path: Path,
-    runtime: str,
-    extra_args: list[str],
-) -> None:
-    """Configure cfg.server from an absolute server path."""
-    if not server_path.is_absolute():
-        click.echo("Error: --server-path must be an absolute path", err=True)
-        sys.exit(1)
-
-    runtime_resolved = runtime
-    if runtime == "auto":
-        suffix = server_path.suffix.lower()
-        if suffix == ".py":
-            runtime_resolved = "python"
-        elif suffix in {".js", ".mjs", ".cjs"}:
-            runtime_resolved = "node"
-        else:
-            runtime_resolved = "exec"
-
-    cfg.server.transport = "stdio"
-    if runtime_resolved == "python":
-        cfg.server.command = sys.executable
-        cfg.server.args = [str(server_path), *extra_args]
-    elif runtime_resolved == "node":
-        cfg.server.command = "node"
-        cfg.server.args = [str(server_path), *extra_args]
-    else:  # exec
-        cfg.server.command = str(server_path)
-        cfg.server.args = list(extra_args)
+def _print_discovered(servers: list[DiscoveredServer]) -> None:
+    """Render discovered servers as a rich table."""
+    table = Table(title="Discovered MCP Servers", show_lines=False)
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("name", style="bold")
+    table.add_column("source")
+    table.add_column("command", overflow="fold")
+    for i, s in enumerate(servers, 1):
+        preview = s.server.command
+        if s.server.args:
+            preview += " " + " ".join(s.server.args[:3])
+            if len(s.server.args) > 3:
+                preview += " ..."
+        table.add_row(str(i), s.name, s.source, preview)
+    console.print(table)
+    console.print(
+        "\n[dim]Run:[/dim] mcp-dynamic-analyzer scan --target <name>"
+    )
 
 
 # ---------------------------------------------------------------------------
