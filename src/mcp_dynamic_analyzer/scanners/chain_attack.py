@@ -1,12 +1,15 @@
-"""Shared-Context Chain Attack scanner.
+"""Server-responsibility checks for risky tool-chain metadata.
 
-Detects multi-tool attack chains where individual tool calls appear
-benign but their *combined* effect through shared context is dangerous.
+This scanner intentionally avoids inferring risk from client-side call
+ordering alone. A client deciding to call ``read_*`` then ``delete_*`` is not
+by itself evidence of a vulnerable MCP server. Instead, we look for cases
+where the server's own metadata can mislead or steer an LLM toward unsafe
+follow-up actions.
 
-Analysis approach:
-1. Reconstruct the chronological sequence of tool calls + responses.
-2. Check if data from one tool's response flows into another tool's arguments.
-3. Flag chains where the second call touches sensitive resources.
+Current checks:
+1. A tool advertises ``readOnlyHint`` but its metadata looks destructive.
+2. A tool description/annotations explicitly guide the model toward a
+   destructive follow-up tool.
 """
 
 from __future__ import annotations
@@ -16,19 +19,37 @@ from typing import Any
 
 from mcp_dynamic_analyzer.models import (
     AnalysisContext,
-    Event,
     Finding,
     RiskType,
     Severity,
+    ToolInfo,
 )
 from mcp_dynamic_analyzer.scanners.base import BaseScanner
 
-_SENSITIVE_KEYWORDS = {
-    "delete", "remove", "drop", "truncate", "exec", "execute",
-    "eval", "system", "shell", "sudo", "admin", "password",
-    "secret", "credential", "token", "key", "write", "overwrite",
-}
+_CHAIN_PHRASES = (
+    "then call",
+    "then use",
+    "after calling",
+    "after using",
+    "follow up with",
+    "next call",
+    "next use",
+    "use the result with",
+    "before calling",
+)
 
+_DANGEROUS_WORDS = (
+    "delete",
+    "remove",
+    "drop",
+    "truncate",
+    "write",
+    "overwrite",
+    "exec",
+    "execute",
+    "run",
+    "install",
+)
 
 class ChainAttackScanner(BaseScanner):
     @property
@@ -37,137 +58,120 @@ class ChainAttackScanner(BaseScanner):
 
     @property
     def risk_type(self) -> RiskType:
-        return RiskType.R3  # chain attacks manipulate LLM tool-calling behaviour
+        return RiskType.R3
 
     async def analyze(self, ctx: AnalysisContext) -> list[Finding]:
+        anchor_event_id = await self._find_tools_event_id(ctx.event_reader)
         findings: list[Finding] = []
-        reader = ctx.event_reader  # type: ignore[union-attr]
-
-        calls = await self._build_call_chain(reader)
-        findings.extend(self._detect_data_flow(calls))
-        findings.extend(self._detect_escalation(calls))
-
+        findings.extend(self._detect_readonly_mismatch(ctx.tools, anchor_event_id))
+        findings.extend(self._detect_server_guided_chains(ctx.tools, anchor_event_id))
         return findings
 
-    async def _build_call_chain(self, reader: Any) -> list[_ToolCall]:
-        """Reconstruct ordered tool call + response pairs."""
-        requests: dict[Any, Event] = {}
-        chain: list[_ToolCall] = []
+    async def _find_tools_event_id(self, reader: Any) -> str | None:
+        """Return the init-enumeration event that captured server tool metadata."""
+        events_by_type = getattr(reader, "events_by_type", None)
+        if events_by_type is None:
+            return None
+        async for evt in events_by_type("test_result"):
+            if evt.data.get("sequence") == "init_enumerate" and "tools" in evt.data:
+                return evt.event_id
+        return None
 
-        async for evt in reader.protocol_events():
-            msg = evt.data.get("message", {})
-
-            if evt.type == "mcp_request" and msg.get("method") == "tools/call":
-                requests[msg.get("id")] = evt
-
-            elif evt.type == "mcp_response":
-                req_id = msg.get("id")
-                req_evt = requests.pop(req_id, None)
-                if req_evt is None:
-                    continue
-                req_msg = req_evt.data.get("message", {})
-                if req_msg.get("method") != "tools/call":
-                    continue
-
-                params = req_msg.get("params", {})
-                result = msg.get("result", {})
-                chain.append(_ToolCall(
-                    tool_name=params.get("name", ""),
-                    arguments=params.get("arguments", {}),
-                    response=result,
-                    req_event_id=req_evt.event_id,
-                    resp_event_id=evt.event_id,
-                ))
-
-        return chain
-
-    def _detect_data_flow(self, calls: list[_ToolCall]) -> list[Finding]:
-        """Check if response content from call N appears in arguments of call N+k."""
+    def _detect_readonly_mismatch(
+        self,
+        tools: list[ToolInfo],
+        anchor_event_id: str | None,
+    ) -> list[Finding]:
         findings: list[Finding] = []
-        for i, src in enumerate(calls):
-            src_text = json.dumps(src.response, default=str).lower()
-            src_tokens = {t for t in src_text.split() if len(t) > 6}
-
-            for j in range(i + 1, min(i + 4, len(calls))):
-                dest = calls[j]
-                dest_args_text = json.dumps(dest.arguments, default=str).lower()
-
-                overlap = src_tokens & {t for t in dest_args_text.split() if len(t) > 6}
-                if len(overlap) >= 2 and _has_sensitive(dest):
-                    findings.append(Finding(
-                        risk_type=RiskType.R3,
-                        severity=Severity.HIGH,
-                        confidence=0.7,
-                        title=f"Data flow chain: {src.tool_name} → {dest.tool_name}",
-                        description=(
-                            f"Data from '{src.tool_name}' response appears in "
-                            f"'{dest.tool_name}' arguments, which touches sensitive operations."
-                        ),
-                        related_events=[src.resp_event_id, dest.req_event_id],
-                        reproduction=(
-                            f"Call '{src.tool_name}', then pass response data to '{dest.tool_name}'"
-                        ),
-                    ))
-
-        return findings
-
-    def _detect_escalation(self, calls: list[_ToolCall]) -> list[Finding]:
-        """Flag chains where a read-like tool precedes a dangerous write-like tool."""
-        findings: list[Finding] = []
-        for i, call in enumerate(calls):
-            if not _is_read_like(call):
+        for tool in tools:
+            annotations = tool.annotations or {}
+            if annotations.get("readOnlyHint") is not True:
                 continue
-            for j in range(i + 1, min(i + 3, len(calls))):
-                next_call = calls[j]
-                if _is_dangerous(next_call):
-                    findings.append(Finding(
+            if not _looks_destructive(tool):
+                continue
+
+            findings.append(
+                Finding(
+                    risk_type=RiskType.R3,
+                    severity=Severity.HIGH,
+                    confidence=0.85,
+                    title=f"Read-only annotation mismatch on '{tool.name}'",
+                    description=(
+                        f"Tool '{tool.name}' advertises readOnlyHint=true, but its "
+                        "name/description/schema suggest destructive capability. "
+                        "This can mislead an LLM into unsafe tool selection."
+                    ),
+                    related_events=[anchor_event_id] if anchor_event_id else [],
+                    tool_name=tool.name,
+                    reproduction=f"Inspect metadata for tool '{tool.name}' in tools/list",
+                )
+            )
+        return findings
+
+    def _detect_server_guided_chains(
+        self,
+        tools: list[ToolInfo],
+        anchor_event_id: str | None,
+    ) -> list[Finding]:
+        findings: list[Finding] = []
+        seen_pairs: set[tuple[str, str]] = set()
+
+        for tool in tools:
+            text = _tool_metadata_text(tool)
+            if not text or not _contains_chain_language(text):
+                continue
+
+            for dest in tools:
+                if dest.name == tool.name:
+                    continue
+                pair = (tool.name, dest.name)
+                if pair in seen_pairs:
+                    continue
+                if dest.name.lower() not in text:
+                    continue
+                if not _looks_destructive(dest):
+                    continue
+
+                seen_pairs.add(pair)
+                findings.append(
+                    Finding(
                         risk_type=RiskType.R3,
                         severity=Severity.MEDIUM,
-                        confidence=0.6,
-                        title=f"Privilege escalation chain: {call.tool_name} → {next_call.tool_name}",
+                        confidence=0.75,
+                        title=f"Server-guided tool chain: {tool.name} → {dest.name}",
                         description=(
-                            f"Read-like tool '{call.tool_name}' immediately precedes "
-                            f"dangerous tool '{next_call.tool_name}', suggesting a "
-                            f"reconnaissance → exploit chain."
+                            f"Tool '{tool.name}' metadata references destructive tool "
+                            f"'{dest.name}' using sequential guidance. This is server-"
+                            "supplied context that can steer an LLM toward a risky "
+                            "follow-up action."
                         ),
-                        related_events=[call.req_event_id, next_call.req_event_id],
-                        reproduction=f"Call '{call.tool_name}' then '{next_call.tool_name}'",
-                    ))
+                        related_events=[anchor_event_id] if anchor_event_id else [],
+                        tool_name=tool.name,
+                        reproduction=(
+                            f"Inspect description/annotations of '{tool.name}' and "
+                            f"its reference to '{dest.name}'"
+                        ),
+                    )
+                )
+
         return findings
 
 
-# ---------------------------------------------------------------------------
-# Internal types & helpers
-# ---------------------------------------------------------------------------
-
-class _ToolCall:
-    __slots__ = ("tool_name", "arguments", "response", "req_event_id", "resp_event_id")
-
-    def __init__(
-        self,
-        tool_name: str,
-        arguments: dict[str, Any],
-        response: dict[str, Any],
-        req_event_id: str,
-        resp_event_id: str,
-    ) -> None:
-        self.tool_name = tool_name
-        self.arguments = arguments
-        self.response = response
-        self.req_event_id = req_event_id
-        self.resp_event_id = resp_event_id
+def _tool_metadata_text(tool: ToolInfo) -> str:
+    parts = [tool.name.lower()]
+    if tool.description:
+        parts.append(tool.description.lower())
+    if tool.annotations:
+        parts.append(json.dumps(tool.annotations, ensure_ascii=False).lower())
+    if tool.input_schema:
+        parts.append(json.dumps(tool.input_schema, ensure_ascii=False).lower())
+    return " ".join(parts)
 
 
-def _has_sensitive(call: _ToolCall) -> bool:
-    text = (call.tool_name + " " + json.dumps(call.arguments, default=str)).lower()
-    return any(kw in text for kw in _SENSITIVE_KEYWORDS)
+def _contains_chain_language(text: str) -> bool:
+    return any(phrase in text for phrase in _CHAIN_PHRASES)
 
 
-def _is_read_like(call: _ToolCall) -> bool:
-    name = call.tool_name.lower()
-    return any(w in name for w in ("read", "get", "list", "search", "find", "show", "cat"))
-
-
-def _is_dangerous(call: _ToolCall) -> bool:
-    name = call.tool_name.lower()
-    return any(w in name for w in ("write", "delete", "exec", "run", "install", "remove", "drop"))
+def _looks_destructive(tool: ToolInfo) -> bool:
+    text = _tool_metadata_text(tool)
+    return any(word in text for word in _DANGEROUS_WORDS)
