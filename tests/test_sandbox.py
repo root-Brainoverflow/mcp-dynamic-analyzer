@@ -1,5 +1,7 @@
 """Tests for sandbox command construction."""
 
+from pathlib import Path
+
 from mcp_dynamic_analyzer.config import NetworkConfig, SandboxConfig, ServerConfig
 from mcp_dynamic_analyzer.infrastructure.sandbox import Sandbox
 
@@ -30,3 +32,24 @@ def test_build_local_cmd_preserves_executable_path_with_spaces() -> None:
         "/Users/test/my-mcp-server/server.py",
     ]
 
+
+def test_build_docker_cmd_mounts_project_root_for_absolute_server_args(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "notion-mcp-server"
+    bin_dir = project_root / "bin"
+    scripts_dir = project_root / "scripts"
+    bin_dir.mkdir(parents=True)
+    scripts_dir.mkdir()
+    (project_root / "package.json").write_text("{}")
+    cli_path = bin_dir / "cli.mjs"
+    cli_path.write_text("console.log('ok')\n")
+    (scripts_dir / "notion-openapi.json").write_text("{}\n")
+
+    server = ServerConfig(command="node", args=[str(cli_path)])
+    sandbox = Sandbox(server, SandboxConfig())
+
+    cmd = sandbox._build_docker_cmd()
+
+    assert f"{project_root.resolve().as_posix()}:/mcp-server-0:ro" in cmd
+    assert "/mcp-server-0/bin/cli.mjs" in cmd

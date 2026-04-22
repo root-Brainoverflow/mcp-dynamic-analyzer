@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from mcp_dynamic_analyzer.correlation.event_store import EventStore
-from mcp_dynamic_analyzer.models import AnalysisContext, RiskType, Severity, ToolInfo
+from mcp_dynamic_analyzer.models import AnalysisContext, Severity, ToolInfo
 
 from tests.conftest import make_event
 
@@ -167,7 +167,37 @@ class TestR6Stability:
 # ---------------------------------------------------------------------------
 
 class TestChainAttack:
-    async def test_escalation_read_then_delete(self, event_store: EventStore) -> None:
+    async def test_readonly_mismatch_in_tool_metadata(self, event_store: EventStore) -> None:
+        from mcp_dynamic_analyzer.scanners.chain_attack import ChainAttackScanner
+        tools = [
+            ToolInfo(
+                name="remove_struct_field",
+                description="Remove a field from a structure definition",
+                annotations={"readOnlyHint": True},
+            ),
+        ]
+        ctx = await _ctx_with_events(event_store, [], tools)
+        findings = await ChainAttackScanner().analyze(ctx)
+        assert any("read-only annotation mismatch" in f.title.lower() for f in findings)
+
+    async def test_server_guided_chain_from_description(self, event_store: EventStore) -> None:
+        from mcp_dynamic_analyzer.scanners.chain_attack import ChainAttackScanner
+        tools = [
+            ToolInfo(
+                name="inspect_struct",
+                description="Inspect a struct, then call remove_struct_field to clean up stale fields.",
+            ),
+            ToolInfo(
+                name="remove_struct_field",
+                description="Remove a field from a structure definition",
+                annotations={"destructiveHint": True},
+            ),
+        ]
+        ctx = await _ctx_with_events(event_store, [], tools)
+        findings = await ChainAttackScanner().analyze(ctx)
+        assert any("server-guided tool chain" in f.title.lower() for f in findings)
+
+    async def test_client_side_call_order_alone_is_ignored(self, event_store: EventStore) -> None:
         from mcp_dynamic_analyzer.scanners.chain_attack import ChainAttackScanner
         ctx = await _ctx_with_events(event_store, [
             make_event("protocol", "mcp_request", direction="c2s",
@@ -182,4 +212,4 @@ class TestChainAttack:
                 message={"jsonrpc": "2.0", "id": 2, "result": {}}),
         ])
         findings = await ChainAttackScanner().analyze(ctx)
-        assert any("escalation" in f.title.lower() for f in findings)
+        assert findings == []

@@ -10,7 +10,7 @@ import asyncio
 import os
 import shutil
 import uuid
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import structlog
@@ -29,6 +29,19 @@ _ENV_VARIATIONS: list[dict[str, str]] = [
     {"USER": "ci-bot", "TZ": "US/Pacific", "LANG": "en_US.UTF-8"},
     {"USER": "root", "TZ": "UTC", "LANG": "C"},
 ]
+
+# Project markers used to widen absolute-path mounts beyond a single file's
+# parent directory. This preserves sibling assets such as ``bin/../scripts``.
+_PROJECT_ROOT_MARKERS = (
+    "package.json",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "Cargo.toml",
+    "go.mod",
+    ".git",
+)
+_MAX_PROJECT_ROOT_ASCENT = 5
 
 
 def generate_env_variation(
@@ -264,6 +277,22 @@ class Sandbox:
         # Windows: "C:\\foo\\bar" → "C:/foo/bar". No-op on POSIX.
         return s.replace("\\", "/")
 
+    @classmethod
+    def _guess_mount_root(cls, path: Path) -> Path:
+        """Return the widest safe mount root for an absolute host path.
+
+        Mounting only the immediate parent directory breaks servers whose entry
+        point reads sibling assets via relative paths (for example
+        ``bin/cli.mjs`` loading ``../scripts/spec.json``). We walk upward a few
+        levels looking for common project markers and mount that root instead.
+        """
+        resolved = path.resolve()
+        start = resolved if resolved.is_dir() else resolved.parent
+        for candidate in [start, *list(start.parents)[:_MAX_PROJECT_ROOT_ASCENT]]:
+            if any((candidate / marker).exists() for marker in _PROJECT_ROOT_MARKERS):
+                return candidate
+        return start
+
     def _build_docker_cmd(self) -> list[str]:
         sb = self._sandbox
         net = sb.network
@@ -279,18 +308,24 @@ class Sandbox:
         for arg in self._server.args:
             p = Path(arg)
             if p.is_absolute() and p.exists():
+                resolved = p.resolve()
+                mount_root = self._guess_mount_root(resolved)
                 # Normalise the host-side key so Windows paths don't collide
                 # with themselves under different slash conventions.
-                host_dir = self._host_mount_source(str(p.parent))
+                host_dir = self._host_mount_source(str(mount_root))
                 # Reuse the same container dir if already mounted.
                 if host_dir not in extra_mounts:
                     extra_mounts[host_dir] = f"/mcp-server-{len(extra_mounts)}"
-                container_path = f"{extra_mounts[host_dir]}/{p.name}"
+                rel_path = resolved.relative_to(mount_root)
+                container_path = str(
+                    PurePosixPath(extra_mounts[host_dir], *rel_path.parts)
+                )
                 log.info(
                     "sandbox.arg_remapped",
                     original=arg,
                     container=container_path,
-                    reason="Absolute host path remapped to container mount point.",
+                    mount_root=str(mount_root),
+                    reason="Absolute host path remapped to a project-root mount.",
                 )
                 remapped_args.append(container_path)
             else:
