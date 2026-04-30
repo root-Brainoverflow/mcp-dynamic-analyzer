@@ -7,13 +7,23 @@ core methods needed for dynamic analysis: ``tools/list``, ``tools/call``,
 
 from __future__ import annotations
 
+import reprlib
 from typing import Any
 
 import structlog
 
-from mcp_dynamic_analyzer.models import ToolInfo
+from mcp_dynamic_analyzer.models import ServerCrashError, ToolInfo
 
 log = structlog.get_logger()
+_REPR = reprlib.Repr()
+_REPR.maxstring = 200
+_REPR.maxother = 200
+_REPR.maxlist = 8
+_REPR.maxtuple = 8
+_REPR.maxset = 8
+_REPR.maxfrozenset = 8
+_REPR.maxdict = 8
+_REPR.maxlevel = 4
 
 MCP_PROTOCOL_VERSION = "2024-11-05"
 
@@ -90,7 +100,7 @@ class McpClient:
         params: dict[str, Any] = {"name": name}
         if arguments is not None:
             params["arguments"] = arguments
-        log.debug("mcp.call_tool", tool=name, arguments=arguments)
+        log.debug("mcp.call_tool", tool=name, arguments=_safe_log_repr(arguments))
         try:
             resp = await self._icp.send_request("tools/call", params)
             result = _unwrap(resp)
@@ -110,14 +120,14 @@ class McpClient:
                 ),
             )
             raise
-        except ConnectionError as exc:
+        except (ConnectionError, ServerCrashError) as exc:
             log.error(
                 "mcp.call_tool.connection_lost",
                 tool=name,
                 error=str(exc),
                 hint="Server stdout closed — the process may have crashed.",
             )
-            raise
+            raise ServerCrashError(str(exc)) from exc
 
     # -- resource / prompt enumeration ---------------------------------------
 
@@ -156,3 +166,10 @@ def _unwrap(resp: dict[str, Any]) -> dict[str, Any]:
         err = resp["error"]
         raise McpError(err.get("code", -1), err.get("message", "unknown"), err.get("data"))
     return resp.get("result", {})
+
+
+def _safe_log_repr(value: Any) -> str:
+    try:
+        return _REPR.repr(value)
+    except Exception:
+        return "<unrepresentable>"

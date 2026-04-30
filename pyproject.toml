@@ -51,3 +51,5 @@ testpaths = ["tests"]
 [tool.pyright]
 pythonVersion = "3.11"
 typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"

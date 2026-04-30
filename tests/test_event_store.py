@@ -31,6 +31,14 @@ class TestEventWriter:
         with pytest.raises(RuntimeError, match="not open"):
             await w.write(make_event())
 
+    async def test_write_escapes_lone_surrogates(self, event_store: EventStore) -> None:
+        event = make_event(payload="\ud800")
+        async with event_store.writer as w:
+            await w.write(event)
+
+        raw = event_store.events_path.read_text(encoding="utf-8")
+        assert "\\ud800" in raw
+
 
 class TestEventReader:
     async def test_count(self, populated_store: EventStore) -> None:

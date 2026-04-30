@@ -15,6 +15,7 @@ Current checks:
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from mcp_dynamic_analyzer.models import (
@@ -172,6 +173,12 @@ def _contains_chain_language(text: str) -> bool:
     return any(phrase in text for phrase in _CHAIN_PHRASES)
 
 
+_DANGEROUS_WORD_RE = re.compile(
+    r"\b(" + "|".join(re.escape(w) for w in _DANGEROUS_WORDS) + r")\b",
+    re.IGNORECASE,
+)
+
+
 def _looks_destructive(tool: ToolInfo) -> bool:
     text = _tool_metadata_text(tool)
-    return any(word in text for word in _DANGEROUS_WORDS)
+    return _DANGEROUS_WORD_RE.search(text) is not None

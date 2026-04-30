@@ -15,7 +15,7 @@ from mcp_dynamic_analyzer.infrastructure.honeypot import Honeypot
 from mcp_dynamic_analyzer.infrastructure.netmon import NetworkMonitor
 from mcp_dynamic_analyzer.infrastructure.sandbox import Sandbox, generate_env_variation
 from mcp_dynamic_analyzer.infrastructure.sysmon import SystemMonitor, SysmonUnavailableError
-from mcp_dynamic_analyzer.models import AnalysisContext, AnalysisOutput, Event, Finding, ToolInfo
+from mcp_dynamic_analyzer.models import AnalysisContext, AnalysisOutput, Event, Finding, ServerCrashError, ToolInfo
 from mcp_dynamic_analyzer.protocol.client import McpClient
 from mcp_dynamic_analyzer.protocol.http_interceptor import HttpInterceptor
 from mcp_dynamic_analyzer.protocol.interceptor import StdioInterceptor
@@ -27,7 +27,7 @@ from mcp_dynamic_analyzer.scanners.r2_code_exec import R2CodeExecScanner
 from mcp_dynamic_analyzer.scanners.r3_llm_manipulation import R3LlmManipulationScanner
 from mcp_dynamic_analyzer.scanners.r4_behavior_drift import R4BehaviorDriftScanner
 from mcp_dynamic_analyzer.scanners.r5_input_validation import FuzzingSequence, R5InputValidationScanner
-from mcp_dynamic_analyzer.scanners.r6_stability import R6StabilityScanner
+from mcp_dynamic_analyzer.scanners.r6_stability import R6StabilityScanner, StabilityFuzzingSequence
 
 log = structlog.get_logger()
 
@@ -60,6 +60,23 @@ def build_default_scanners(config: AnalysisConfig) -> list[BaseScanner]:
     return [s for s, enabled in all_scanners if enabled]
 
 
+def build_default_sequences(
+    config: AnalysisConfig,
+    session_id: str,
+    *,
+    extra_sequences: list[TestSequence] | None = None,
+) -> list[TestSequence]:
+    """Build the default collection sequences for a scan session."""
+    sequences: list[TestSequence] = [InitSequence(session_id)]
+    if config.scanners.r5_input_validation.enabled:
+        sequences.append(FuzzingSequence(session_id=session_id))
+    if config.scanners.r6_stability.enabled:
+        sequences.append(StabilityFuzzingSequence(session_id=session_id))
+    if extra_sequences:
+        sequences.extend(extra_sequences)
+    return sequences
+
+
 def _session_id() -> str:
     return f"ses-{uuid4()}"
 
@@ -80,16 +97,16 @@ async def run_analysis(
 
     log.info("orchestrator.collection.start", session_id=session_id)
 
-    sequences: list[TestSequence] = [InitSequence(session_id)]
-    if config.scanners.r5_input_validation.enabled:
-        sequences.append(
-            FuzzingSequence(
-                session_id=session_id,
-                fuzz_rounds=config.scanners.r5_input_validation.fuzz_rounds,
-            ),
-        )
-    if extra_sequences:
-        sequences.extend(extra_sequences)
+    sequences = build_default_sequences(
+        config,
+        session_id,
+        extra_sequences=extra_sequences,
+    )
+
+    # Sidecar IPs accumulate across all sandbox iterations so analysis-phase
+    # scanners (R1) can recognise them as legitimate destinations rather than
+    # SSRF attempts at RFC1918 addresses.
+    trusted_internal_ips: set[str] = set()
 
     try:
         tools = await _collect(
@@ -98,6 +115,7 @@ async def run_analysis(
             event_store=event_store,
             sequences=sequences,
             use_docker=use_docker,
+            trusted_internal_ips=trusted_internal_ips,
         )
     except RuntimeError as exc:
         # Server process exited immediately (startup failure).
@@ -111,6 +129,10 @@ async def run_analysis(
             ),
         )
         raise
+
+    # If the first collection timed out before returning tools, recover from events.
+    if not tools:
+        tools = await _read_tools_from_events(event_store.reader)
 
     if not tools:
         log.warning(
@@ -137,6 +159,7 @@ async def run_analysis(
                     use_docker=use_docker,
                     env_override=env_override,
                     variation_tag=tag,
+                    trusted_internal_ips=trusted_internal_ips,
                 )
             except RuntimeError as exc:
                 log.warning(
@@ -150,11 +173,19 @@ async def run_analysis(
 
     log.info("orchestrator.analysis.start")
     reader = event_store.reader
+
+    # Hand the collected sidecar IPs to scanners through static_context so
+    # they can distinguish legitimate sidecar traffic from SSRF candidates.
+    merged_static = dict(static_context or {})
+    if trusted_internal_ips:
+        existing = set(merged_static.get("trusted_internal_ips") or [])
+        merged_static["trusted_internal_ips"] = sorted(existing | trusted_internal_ips)
+
     ctx = AnalysisContext(
         session_id=session_id,
         event_reader=reader,
         tools=tools,
-        static_context=static_context,
+        static_context=merged_static or None,
         config=config.model_dump(),
     )
 
@@ -204,6 +235,9 @@ async def run_analysis(
     return output
 
 
+_MAX_CRASH_RESTARTS = 3
+
+
 async def _collect(
     *,
     config: AnalysisConfig,
@@ -213,10 +247,15 @@ async def _collect(
     use_docker: bool,
     env_override: dict[str, str] | None = None,
     variation_tag: str | None = None,
+    trusted_internal_ips: set[str] | None = None,
 ) -> list[ToolInfo]:
-    """Run collection sequences inside a sandbox, return discovered tools."""
+    """Run collection sequences inside a sandbox, return discovered tools.
+
+    If the server crashes mid-sequence, the sandbox is restarted and the
+    remaining sequences continue on the fresh container (up to
+    ``_MAX_CRASH_RESTARTS`` times).
+    """
     tools: list[ToolInfo] = []
-    monitors: list[Any] = []
     honeypot: Honeypot | None = None
 
     async with event_store.writer as base_writer:
@@ -227,64 +266,97 @@ async def _collect(
             honeypot = Honeypot(writer, session_id)
             honeypot_dir = str(honeypot.create())
 
-        async with Sandbox(
-            config.server,
-            config.sandbox,
-            env_override=env_override,
-            honeypot_dir=honeypot_dir,
-            use_docker=use_docker,
-        ) as sandbox:
-            interceptor = await _create_interceptor(config, sandbox, writer, session_id)
-            client = McpClient(interceptor)
-            sequencer = Sequencer(session_id, client, writer, sequences)
+        remaining = list(sequences)
+        crash_count = 0
+        sysmon_enabled = (
+            config.scanners.r1_data_access.enabled
+            or config.scanners.r2_code_exec.enabled
+        )
 
-            try:
-                monitors = await _start_monitors(config, session_id, writer, sandbox, honeypot)
+        while remaining:
+            monitors: list[Any] = []
+            async with Sandbox(
+                config.server,
+                config.sandbox,
+                env_override=env_override,
+                honeypot_dir=honeypot_dir,
+                use_docker=use_docker,
+                sysmon_enabled=sysmon_enabled,
+            ) as sandbox:
+                # Capture sidecar IPs as soon as the sandbox is up — they
+                # exist for the duration of the ``async with`` block and
+                # disappear on cleanup, so reading after this point fails.
+                if trusted_internal_ips is not None and sandbox.sidecar_ips:
+                    trusted_internal_ips.update(sandbox.sidecar_ips)
 
-                await asyncio.wait_for(
-                    sequencer.run_all(),
-                    timeout=config.sandbox.timeout,
-                )
-                # Prefer tools already discovered during InitSequence (stored in
-                # the event log) rather than making a second list_tools call after
-                # sequences complete — by that point the server may have shut down.
-                tools = await _read_tools_from_events(event_store.reader)
-                if not tools:
-                    # Fallback: server still running, try one more list_tools call.
-                    try:
-                        tools = await client.list_tools()
-                    except Exception as exc:
-                        log.warning(
-                            "orchestrator.list_tools_after_sequences_failed",
-                            error=str(exc),
-                        )
+                interceptor = await _create_interceptor(config, sandbox, writer, session_id)
+                client = McpClient(interceptor)
+                sequencer = Sequencer(session_id, client, writer, remaining)
 
-            except asyncio.TimeoutError:
-                log.warning(
-                    "orchestrator.global_timeout",
-                    timeout=config.sandbox.timeout,
-                    hint="Increase sandbox.timeout in config if the server needs more time.",
-                )
-            except ConnectionError as exc:
-                # The server's stdout stream closed unexpectedly — the process
-                # likely crashed or the backend killed it.
-                log.error(
-                    "orchestrator.server_stream_closed",
-                    error=str(exc),
-                    is_running=sandbox.is_running,
-                    hint=(
-                        "Server stdout EOF — the process may have crashed. "
-                        "Check sandbox.server_stderr log lines above for details."
-                    ),
-                )
-            finally:
-                # Log the server's exit code if it already terminated.
-                if not sandbox.is_running:
-                    proc = sandbox._proc  # noqa: SLF001
-                    rc = proc.returncode if proc else None
-                    log.warning("orchestrator.server_exited_early", rc=rc)
-                await _stop_monitors(monitors, honeypot)
-                await interceptor.close()
+                try:
+                    monitors = await _start_monitors(config, session_id, writer, sandbox, honeypot)
+
+                    await asyncio.wait_for(
+                        sequencer.run_all(),
+                        timeout=config.sandbox.timeout,
+                    )
+                    tools = await _read_tools_from_events(event_store.reader)
+                    if not tools:
+                        try:
+                            tools = await client.list_tools()
+                        except Exception as exc:
+                            log.warning(
+                                "orchestrator.list_tools_after_sequences_failed",
+                                error=str(exc),
+                            )
+                    remaining = []  # all sequences done
+
+                except ServerCrashError as exc:
+                    crash_count += 1
+                    remaining = getattr(exc, "remaining_sequences", [])
+                    log.warning(
+                        "orchestrator.server_crashed",
+                        crash_count=crash_count,
+                        remaining_sequences=[s.name for s in remaining],
+                        hint=(
+                            "Server process crashed mid-scan. "
+                            f"Restarting sandbox to continue ({crash_count}/{_MAX_CRASH_RESTARTS})."
+                            if remaining and crash_count < _MAX_CRASH_RESTARTS
+                            else "Max crash restarts reached — skipping remaining sequences."
+                        ),
+                    )
+                    tools = await _read_tools_from_events(event_store.reader)
+                    if crash_count >= _MAX_CRASH_RESTARTS:
+                        remaining = []
+
+                except asyncio.TimeoutError:
+                    log.warning(
+                        "orchestrator.global_timeout",
+                        timeout=config.sandbox.timeout,
+                        hint="Increase sandbox.timeout in config if the server needs more time.",
+                    )
+                    tools = await _read_tools_from_events(event_store.reader)
+                    remaining = []
+
+                except ConnectionError as exc:
+                    log.error(
+                        "orchestrator.server_stream_closed",
+                        error=str(exc),
+                        is_running=sandbox.is_running,
+                        hint=(
+                            "Server stdout EOF — the process may have crashed. "
+                            "Check sandbox.server_stderr log lines above for details."
+                        ),
+                    )
+                    remaining = []
+
+                finally:
+                    if not sandbox.is_running:
+                        proc = sandbox._proc  # noqa: SLF001
+                        rc = proc.returncode if proc else None
+                        log.warning("orchestrator.server_exited_early", rc=rc)
+                    await _stop_monitors(monitors, honeypot)
+                    await interceptor.close()
 
         if honeypot is not None:
             honeypot.cleanup()
@@ -293,16 +365,34 @@ async def _collect(
 
 
 async def _read_tools_from_events(reader: Any) -> list[ToolInfo]:
-    """Recover the tools list from the init_enumerate test_result event.
+    """Recover the tools list from the event log.
 
-    InitSequence writes a ``test_result`` event containing the full tools list.
-    Reading it back avoids a second ``tools/list`` call after the sequences
-    complete (by which time the server may have exited).
+    Primary source: the ``init_enumerate`` test_result event written by
+    ``InitSequence``. If that sequence timed out before completing, fall back
+    to scanning ``mcp_response`` events for any successful ``tools/list``
+    response — the FuzzingSequence and other sequences also call list_tools()
+    directly, leaving a usable response in the log.
     """
     async for evt in reader.events_by_type("test_result"):
         data = evt.data
         if data.get("sequence") == "init_enumerate" and "tools" in data:
             return [ToolInfo(**t) for t in data["tools"]]
+
+    async for evt in reader.events_by_type("mcp_response"):
+        msg = evt.data.get("message", {}) if isinstance(evt.data, dict) else {}
+        result = msg.get("result", {}) if isinstance(msg, dict) else {}
+        tools_raw = result.get("tools") if isinstance(result, dict) else None
+        if isinstance(tools_raw, list) and tools_raw:
+            recovered: list[ToolInfo] = []
+            for t in tools_raw:
+                if not isinstance(t, dict) or "name" not in t:
+                    continue
+                try:
+                    recovered.append(ToolInfo(**t))
+                except Exception:
+                    continue
+            if recovered:
+                return recovered
     return []
 
 
@@ -374,11 +464,17 @@ async def _start_monitors(
 
     net_cfg = config.sandbox.network
     if net_cfg.log_all_traffic or net_cfg.mode == "allowlist":
+        # On sidecar networks (``--internal``), every reachable address is
+        # intra-network by construction; the host bridge and external
+        # routing don't exist for the MCP container. Disable the RFC1918
+        # heuristic in that case so legitimate sidecar traffic isn't
+        # reported as a blocked SSRF attempt.
+        block_internal = net_cfg.block_internal and not sandbox.has_sidecars
         netmon = NetworkMonitor(
             writer=writer,
             session_id=session_id,
             allowlist=net_cfg.allowlist,
-            block_internal=net_cfg.block_internal,
+            block_internal=block_internal,
             docker_container=sandbox.container_name,
         )
         try:
@@ -408,5 +504,3 @@ async def _stop_monitors(monitors: list[Any], honeypot: Honeypot | None) -> None
             await honeypot.stop_monitoring()
         except Exception:
             log.exception("monitor.honeypot_stop_failed")
-
-

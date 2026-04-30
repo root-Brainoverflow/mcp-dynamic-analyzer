@@ -13,7 +13,7 @@ from typing import Any
 import structlog
 
 from mcp_dynamic_analyzer.correlation.event_store import EventWriter
-from mcp_dynamic_analyzer.models import Event
+from mcp_dynamic_analyzer.models import Event, ServerCrashError
 
 log = structlog.get_logger()
 
@@ -47,6 +47,7 @@ class StdioInterceptor:
         self._reader_task: asyncio.Task[None] | None = None
         self.notifications: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._closed = False
+        self.server_died = False
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -82,6 +83,9 @@ class StdioInterceptor:
         if params is not None:
             msg["params"] = params
 
+        if self.server_died:
+            raise ServerCrashError("server has already crashed")
+
         fut: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
         self._pending[req_id] = fut
 
@@ -102,7 +106,9 @@ class StdioInterceptor:
     # -- internal I/O --------------------------------------------------------
 
     async def _write_to_server(self, msg: dict[str, Any], *, direction: str) -> None:
-        raw = json.dumps(msg, ensure_ascii=False)
+        # Keep wire payload ASCII-safe so lone-surrogate fuzz strings survive
+        # transport as ``\uXXXX`` escapes instead of crashing UTF-8 encoding.
+        raw = json.dumps(msg, ensure_ascii=True)
         self._stdin.write((raw + "\n").encode())
         await self._stdin.drain()
         await self._record(msg, direction=direction)
@@ -113,7 +119,8 @@ class StdioInterceptor:
             while not self._closed:
                 line = await self._stdout.readline()
                 if not line:
-                    log.info("interceptor.eof")
+                    log.warning("interceptor.eof", hint="Server stdout closed — process likely crashed.")
+                    self.server_died = True
                     break
                 text = line.decode().strip()
                 if not text:
@@ -131,9 +138,10 @@ class StdioInterceptor:
         except Exception:
             log.exception("interceptor.read_loop_error")
         finally:
+            exc = ServerCrashError("server stream ended") if self.server_died else ConnectionError("server stream ended")
             for fut in self._pending.values():
                 if not fut.done():
-                    fut.set_exception(ConnectionError("server stream ended"))
+                    fut.set_exception(exc)
             self._pending.clear()
 
     def _dispatch(self, msg: dict[str, Any]) -> None:

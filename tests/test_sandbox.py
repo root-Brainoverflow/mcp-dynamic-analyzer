@@ -1,8 +1,10 @@
 """Tests for sandbox command construction."""
 
+import asyncio
 from pathlib import Path
 
 from mcp_dynamic_analyzer.config import NetworkConfig, SandboxConfig, ServerConfig
+from mcp_dynamic_analyzer.infrastructure.bootstrap import SourcePreflightInspector
 from mcp_dynamic_analyzer.infrastructure.sandbox import Sandbox
 
 
@@ -53,3 +55,23 @@ def test_build_docker_cmd_mounts_project_root_for_absolute_server_args(
 
     assert f"{project_root.resolve().as_posix()}:/mcp-server-0:ro" in cmd
     assert "/mcp-server-0/bin/cli.mjs" in cmd
+
+
+def test_prepare_bootstrap_is_noop_in_local_mode() -> None:
+    class ExplodingInspector(SourcePreflightInspector):
+        async def inspect(self, *args, **kwargs):  # type: ignore[override]
+            raise AssertionError("preflight inspector should not run in local mode")
+
+    server = ServerConfig(command="npx", args=["@playwright/mcp@latest"])
+    sandbox = Sandbox(
+        server,
+        SandboxConfig(),
+        use_docker=False,
+        preflight_inspector=ExplodingInspector(),
+    )
+
+    asyncio.run(sandbox._prepare_bootstrap_image())
+
+    assert sandbox._preflight_evidence is None
+    assert sandbox._bootstrap_plan is None
+    assert sandbox._bootstrap_image is None

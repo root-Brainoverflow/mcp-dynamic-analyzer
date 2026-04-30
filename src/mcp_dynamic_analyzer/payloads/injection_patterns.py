@@ -41,9 +41,18 @@ _DESCRIPTION_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     (
         "urgency_pressure",
         re.compile(
-            r"(you\s+must|always\s+use\s+this|this\s+is\s+(the\s+)?best|"
-            r"never\s+use\s+(any\s+)?other|do\s+not\s+skip|"
-            r"critical[:\s]|important[:\s]|urgent[:\s])",
+            # Bare "you must" / "important:" appear in legitimate operational
+            # documentation ("You must call X first", "IMPORTANT: rate-limited
+            # to 3 calls"). Require pairing with a manipulation verb so we
+            # only flag wording that pressures the LLM to bypass normal
+            # behaviour or trust this tool unconditionally.
+            r"(you\s+must\s+(always|never|trust|use\s+only|use\s+this|skip|ignore|"
+            r"not\s+(call|use|tell|inform|reveal))|"
+            r"always\s+use\s+this\s+(tool|first|over)|"
+            r"this\s+is\s+(the\s+)?(best|only|safest|trusted)\s+(tool|option|choice|version)|"
+            r"never\s+use\s+(any\s+)?(other|alternative)|"
+            r"(critical|important|urgent)\s*:\s*"
+            r"(ignore|always|never|forward|exfiltrate|do\s+not\s+(tell|inform|reveal)))",
             re.IGNORECASE,
         ),
         "MEDIUM",

@@ -1,0 +1,306 @@
+---
+# Built-in prerequisite recipes for MCP server bootstrap planning.
+#
+# Only tools that require non-apt install commands (browser binary downloads,
+# pip installs, etc.) belong here.  Plain system libraries handled by
+# apt-get are covered dynamically by _apt_packages_from_stderr in sandbox.py.
+#
+# Match evaluation rules
+# ──────────────────────
+#  AND conditions (all must be satisfied):
+#    runtime_prefix       – image name must start with this string
+#    source_signals_any   – at least one signal must be present
+#    source_signals_none  – none of these signals may be present
+#
+#  OR gate (at least one block in any_of must be satisfied):
+#    node_deps_any        – evidence.node_deps contains one of these
+#    python_deps_any      – evidence.python_deps contains one of these
+#    identity_tokens_any  – server command/args contain one of these (case-insensitive)
+#    stderr_tokens_any    – stderr snippet contains one of these (case-insensitive)
+
+recipes:
+
+  # ───────────────────────────── Playwright / Node.js ──────────────────────────
+
+  - id: playwright-node-chrome
+    description: "Playwright Chrome browser (Node.js)"
+    match:
+      runtime_prefix: "mcp-sandbox-node"
+      source_signals_any:
+        - playwright.channel.chrome
+        - browser.exec.google-chrome
+        - browser.path.google-chrome
+      any_of:
+        - node_deps_any:
+            - playwright
+            - "@playwright/test"
+            - playwright-core
+        - identity_tokens_any:
+            - "@playwright/mcp"
+            - playwright-mcp
+            - "playwright mcp"
+    dockerfile_lines:
+      - "USER root"
+      - "ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright"
+      - "RUN npx -y playwright install --with-deps chrome"
+      - "USER user"
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+
+  - id: playwright-node-chromium
+    description: "Playwright Chromium browser (Node.js)"
+    match:
+      runtime_prefix: "mcp-sandbox-node"
+      source_signals_none:
+        - playwright.channel.chrome
+        - browser.exec.google-chrome
+        - browser.path.google-chrome
+      any_of:
+        - node_deps_any:
+            - playwright
+            - "@playwright/test"
+            - playwright-core
+        - identity_tokens_any:
+            - "@playwright/mcp"
+            - playwright-mcp
+            - "playwright mcp"
+        - stderr_tokens_any:
+            - "playwright install"
+            - "chromium distribution 'chrome' is not found"
+            - /opt/google/chrome/chrome
+    dockerfile_lines:
+      - "USER root"
+      - "ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright"
+      - "RUN npx -y playwright install --with-deps chromium"
+      - "USER user"
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+
+  # ───────────────────────────── Playwright / Python ───────────────────────────
+
+  - id: playwright-python-chrome
+    description: "Playwright Chrome browser (Python)"
+    match:
+      runtime_prefix: "mcp-sandbox-python"
+      source_signals_any:
+        - playwright.channel.chrome
+        - browser.exec.google-chrome
+        - browser.path.google-chrome
+      any_of:
+        - python_deps_any:
+            - playwright
+        - identity_tokens_any:
+            - mcp-server-playwright
+            - playwright-mcp
+    dockerfile_lines:
+      - "USER root"
+      - "ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright"
+      - "RUN python3 -m pip install --no-cache-dir playwright && python3 -m playwright install --with-deps chrome"
+      - "USER user"
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+
+  - id: playwright-python-chromium
+    description: "Playwright Chromium browser (Python)"
+    match:
+      runtime_prefix: "mcp-sandbox-python"
+      source_signals_none:
+        - playwright.channel.chrome
+        - browser.exec.google-chrome
+        - browser.path.google-chrome
+      any_of:
+        - python_deps_any:
+            - playwright
+        - identity_tokens_any:
+            - mcp-server-playwright
+            - playwright-mcp
+        - stderr_tokens_any:
+            - "playwright install"
+            - "chromium distribution 'chrome' is not found"
+    dockerfile_lines:
+      - "USER root"
+      - "ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright"
+      - "RUN python3 -m pip install --no-cache-dir playwright && python3 -m playwright install --with-deps chromium"
+      - "USER user"
+    env:
+      PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
+
+  # ───────────────────────────── Backend service sidecars ─────────────────────
+  #
+  # MCP servers that talk to a real database / cache / queue must NEVER touch
+  # the host's actual data store. These recipes spin up an ephemeral sidecar
+  # backend on a private docker network and rewrite the connection-string arg
+  # so the user's discovered config (which may point at production credentials)
+  # gets redirected to the throwaway instance.
+
+  - id: postgres-mcp-python-install
+    description: "Pre-install crystaldba/postgres-mcp PyPI package"
+    match:
+      runtime_prefix: "mcp-sandbox-python"
+      any_of:
+        - identity_tokens_any:
+            - "postgres-mcp"
+            - "postgresql-mcp"
+        - package_name_any:
+            - "postgres-mcp"
+            - "postgresql-mcp"
+    # Crystal DBA's postgres-mcp is published on PyPI but not bundled in the
+    # base image, so ``uv run postgres-mcp`` exits with ENOENT. Install it
+    # at build time so ``uv run``'s PATH search finds /usr/local/bin/postgres-mcp.
+    # Build-time install also matters because the runtime network is
+    # ``--internal`` (host blocked), so PyPI is unreachable at run time.
+    dockerfile_lines:
+      - "USER root"
+      - "RUN pip install --no-cache-dir postgres-mcp"
+      - "USER user"
+
+  - id: postgres-mcp-node-install
+    description: "Pre-install @modelcontextprotocol/server-postgres npm package"
+    match:
+      runtime_prefix: "mcp-sandbox-node"
+      any_of:
+        - identity_tokens_any:
+            - "@modelcontextprotocol/server-postgres"
+            - "mcp-server-postgres"
+        - package_name_any:
+            - "server-postgres"
+    # Sidecar runs on an ``--internal`` network so npx cannot fetch the
+    # package at run time; install it globally during image build instead.
+    dockerfile_lines:
+      - "USER root"
+      - "RUN npm install -g @modelcontextprotocol/server-postgres"
+      - "USER user"
+
+  - id: postgres-mcp-sidecar
+    description: "Ephemeral PostgreSQL backend for postgres-mcp"
+    match:
+      any_of:
+        - identity_tokens_any:
+            - "@modelcontextprotocol/server-postgres"
+            - "mcp-server-postgres"
+            - "postgres-mcp"
+            - "postgresql-mcp"
+        - package_name_any:
+            - "server-postgres"
+            - "postgres-mcp"
+            - "postgresql-mcp"
+    services:
+      - alias: db
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: scan
+          POSTGRES_PASSWORD: scan
+          POSTGRES_DB: scan
+        health_cmd: ["pg_isready", "-U", "scan", "-d", "scan"]
+        port: 5432
+        startup_timeout_sec: 30
+    # Many postgres MCP variants read the connection string from env rather
+    # than args (e.g. crystaldba/postgres-mcp uses DATABASE_URI). Inject all
+    # common variant names; whichever the server reads, it lands on the
+    # ephemeral sidecar. These env values take priority over user-supplied
+    # values because the recipe declares a ``services`` block (see
+    # BootstrapPlan.forced_runtime_env).
+    env:
+      DATABASE_URL: "postgres://scan:scan@db:5432/scan"
+      DATABASE_URI: "postgres://scan:scan@db:5432/scan"
+      POSTGRES_URL: "postgres://scan:scan@db:5432/scan"
+      POSTGRES_URI: "postgres://scan:scan@db:5432/scan"
+      POSTGRES_CONNECTION_STRING: "postgres://scan:scan@db:5432/scan"
+      PG_CONNECTION_STRING: "postgres://scan:scan@db:5432/scan"
+      PGHOST: "db"
+      PGPORT: "5432"
+      PGUSER: "scan"
+      PGPASSWORD: "scan"
+      PGDATABASE: "scan"
+    arg_rewrites:
+      - pattern: 'postgres(?:ql)?://[^\s"]+'
+        replacement: 'postgres://scan:scan@db:5432/scan'
+
+  - id: mysql-mcp-sidecar
+    description: "Ephemeral MySQL backend for mysql-mcp"
+    match:
+      any_of:
+        - identity_tokens_any:
+            - "@modelcontextprotocol/server-mysql"
+            - "mcp-server-mysql"
+            - "mysql-mcp"
+        - package_name_any:
+            - "server-mysql"
+            - "mysql-mcp"
+    services:
+      - alias: db
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: scan
+          MYSQL_DATABASE: scan
+          MYSQL_USER: scan
+          MYSQL_PASSWORD: scan
+        health_cmd: ["mysqladmin", "ping", "-uscan", "-pscan", "--silent"]
+        port: 3306
+        startup_timeout_sec: 60
+    arg_rewrites:
+      - pattern: 'mysql://[^\s"]+'
+        replacement: 'mysql://scan:scan@db:3306/scan'
+
+  - id: redis-mcp-sidecar
+    description: "Ephemeral Redis backend for redis-mcp"
+    match:
+      any_of:
+        - identity_tokens_any:
+            - "@modelcontextprotocol/server-redis"
+            - "mcp-server-redis"
+            - "redis-mcp"
+        - package_name_any:
+            - "server-redis"
+            - "redis-mcp"
+    services:
+      - alias: cache
+        image: redis:7-alpine
+        health_cmd: ["redis-cli", "ping"]
+        port: 6379
+        startup_timeout_sec: 15
+    arg_rewrites:
+      - pattern: 'redis://[^\s"]+'
+        replacement: 'redis://cache:6379/0'
+
+  - id: mongodb-mcp-sidecar
+    description: "Ephemeral MongoDB backend for mongodb-mcp"
+    match:
+      any_of:
+        - identity_tokens_any:
+            - "@modelcontextprotocol/server-mongodb"
+            - "mcp-server-mongodb"
+            - "mongodb-mcp"
+        - package_name_any:
+            - "server-mongodb"
+            - "mongodb-mcp"
+    services:
+      - alias: db
+        image: mongo:7
+        env:
+          MONGO_INITDB_ROOT_USERNAME: scan
+          MONGO_INITDB_ROOT_PASSWORD: scan
+        health_cmd: ["mongosh", "--quiet", "--eval", "db.runCommand({ping:1}).ok"]
+        port: 27017
+        startup_timeout_sec: 30
+    arg_rewrites:
+      - pattern: 'mongodb(?:\+srv)?://[^\s"]+'
+        replacement: 'mongodb://scan:scan@db:27017/scan?authSource=admin'
+
+  # ───────────────────────────── Puppeteer / Node.js ───────────────────────────
+
+  - id: puppeteer-node
+    description: "Puppeteer Chromium browser (Node.js)"
+    match:
+      runtime_prefix: "mcp-sandbox-node"
+      any_of:
+        - node_deps_any:
+            - puppeteer
+            - puppeteer-core
+        - identity_tokens_any:
+            - puppeteer
+    dockerfile_lines:
+      - "USER root"
+      - "RUN npx -y puppeteer browsers install chrome"
+      - "USER user"
+    env: {}

@@ -1,8 +1,8 @@
 """R2: Unauthorized Code/Command Execution scanner.
 
-Analyses ``process_exec`` (execve) syscall events to detect:
-* Execution of shells (sh, bash, zsh, cmd, powershell)
-* Execution of package managers (pip, npm, curl, wget) that could install malware
+Analyses:
+* ``process_exec`` (execve) syscall events — shell / installer spawning
+* ``test_result`` events from R5 fuzzing — RCE indicator strings in responses
 * Correlation: execve shortly after a fuzzing test_input ⇒ command injection succeeded
 """
 
@@ -18,6 +18,8 @@ from mcp_dynamic_analyzer.models import (
     RiskType,
     Severity,
 )
+from mcp_dynamic_analyzer.payloads._response_filters import is_validation_rejection
+from mcp_dynamic_analyzer.payloads.rce import looks_like_rce_success
 from mcp_dynamic_analyzer.scanners.base import BaseScanner
 
 _SHELLS = {"sh", "bash", "zsh", "dash", "csh", "fish", "cmd", "cmd.exe", "powershell", "pwsh"}
@@ -46,6 +48,7 @@ class R2CodeExecScanner(BaseScanner):
         async for evt in reader.events_by_type("test_input"):
             fuzz_events.append(evt)
 
+        # Syscall-level analysis.
         for evt in exec_events:
             exe = _executable(evt)
             base = exe.rsplit("/", 1)[-1].lower() if exe else ""
@@ -87,6 +90,42 @@ class R2CodeExecScanner(BaseScanner):
                         related_events=[evt.event_id, correlated.event_id],
                         reproduction="Send command-injection payload and monitor execve",
                     ))
+
+        # Response-text analysis — RCE output in fuzz results.
+        findings.extend(await self._check_rce_responses(ctx))
+
+        return findings
+
+    async def _check_rce_responses(self, ctx: AnalysisContext) -> list[Finding]:
+        """Check fuzz test_result events for RCE-indicator strings in responses."""
+        findings: list[Finding] = []
+        reader = ctx.event_reader  # type: ignore[union-attr]
+
+        async for evt in reader.events_by_type("test_result"):
+            resp = evt.data.get("response_preview", "")
+            if not resp:
+                continue
+            # If the server rejected the payload at the validation layer,
+            # any RCE-looking string in the response is just payload reflection.
+            if is_validation_rejection(resp):
+                continue
+            if looks_like_rce_success(resp):
+                tool = evt.data.get("tool", "unknown")
+                cat = evt.data.get("category", "")
+                findings.append(Finding(
+                    risk_type=RiskType.R2,
+                    severity=Severity.CRITICAL,
+                    confidence=0.85,
+                    title=f"RCE indicator in response for tool '{tool}' (category '{cat}')",
+                    description=(
+                        f"Tool '{tool}' returned content matching RCE success indicators "
+                        f"after being sent a '{cat}' payload. "
+                        f"Response excerpt: {resp[:300]}"
+                    ),
+                    related_events=[evt.event_id],
+                    tool_name=tool,
+                    reproduction=f"Send '{cat}' payload to tool '{tool}' and inspect response",
+                ))
 
         return findings
 

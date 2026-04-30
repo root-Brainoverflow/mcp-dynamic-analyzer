@@ -48,7 +48,10 @@ class EventWriter:
             msg = "EventWriter is not open — call open() first"
             raise RuntimeError(msg)
         assert self._lock is not None
-        line = event.model_dump_json() + "\n"
+        # ``model_dump_json()`` fails on lone-surrogate fuzz payloads because it
+        # emits UTF-8 directly. Dump through stdlib json with ensure_ascii=True
+        # so invalid Unicode code points stay escaped in the JSONL file.
+        line = json.dumps(event.model_dump(mode="json"), ensure_ascii=True) + "\n"
         # Serialize writes: prevents interleaved bytes when concurrent coroutines
         # (interceptor, sequencer, monitors) write large and small events at the
         # same time through aiofiles' thread-pool executor.

@@ -20,7 +20,7 @@ sandbox:
 scanners:
   r1_data_access: { enabled: true }
   r2_code_exec: { enabled: false }
-  r3_llm_manipulation: { enabled: true, llm_api: null }
+  r3_llm_manipulation: { enabled: true }
   r4_behavior_drift: { enabled: false }
   r5_input_validation: { enabled: true, fuzz_rounds: 3 }
   r6_stability: { enabled: false }

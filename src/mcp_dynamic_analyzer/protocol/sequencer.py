@@ -43,9 +43,21 @@ class Sequencer:
         self._sequences = sequences
 
     async def run_all(self) -> None:
-        """Execute every registered sequence, isolating failures."""
-        for seq in self._sequences:
-            await self._run_one(seq)
+        """Execute every registered sequence, isolating failures.
+
+        Raises ``ServerCrashError`` (with ``remaining_sequences`` attribute set)
+        when the server process dies mid-sequence so the orchestrator can restart
+        the sandbox and continue with the sequences that have not yet run.
+        """
+        for i, seq in enumerate(self._sequences):
+            try:
+                await self._run_one(seq)
+            except ServerCrashError as exc:
+                # Include the crashed sequence itself so the restart reruns it
+                # from the beginning — partial results up to the crash point
+                # are already in the log, the rerun fills in the rest.
+                exc.remaining_sequences = self._sequences[i:]  # type: ignore[attr-defined]
+                raise
 
     async def _run_one(self, seq: TestSequence) -> None:
         log.info("sequencer.start", sequence=seq.name, timeout=seq.timeout)
@@ -63,6 +75,7 @@ class Sequencer:
         except ServerCrashError:
             log.error("sequencer.crash", sequence=seq.name)
             await self._record("server_crash", {"sequence": seq.name})
+            raise
 
         except Exception as exc:
             log.error("sequencer.error", sequence=seq.name, error=str(exc))
@@ -94,6 +107,14 @@ class InitSequence(TestSequence):
     @property
     def name(self) -> str:
         return "init_enumerate"
+
+    @property
+    def timeout(self) -> float:
+        # Initial handshake + tools/list can be slow on the first run of an
+        # env-variation container: npx must download the package fresh
+        # because the previous sandbox exited with --rm. 30 s is too tight
+        # for that path; 60 s gives enough headroom while still bounding hangs.
+        return 60.0
 
     async def execute(self, client: Any, writer: EventWriter) -> None:
         cli: McpClient = client

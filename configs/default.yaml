@@ -29,7 +29,6 @@ scanners:
 
   r3_llm_manipulation:
     enabled: true
-    llm_api: null          # null = pattern-only, "anthropic" = LLM impact test
 
   r4_behavior_drift:
     enabled: true

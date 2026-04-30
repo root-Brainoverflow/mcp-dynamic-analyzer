@@ -89,7 +89,7 @@ class ScannerToggle(BaseModel):
 
 
 class R3Config(ScannerToggle):
-    llm_api: str | None = None
+    pass
 
 
 class R4Config(ScannerToggle):

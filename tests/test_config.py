@@ -15,7 +15,6 @@ class TestLoadConfig:
         assert cfg.server.transport == "stdio"
         assert cfg.sandbox.timeout == 300
         assert cfg.sandbox.network.mode == "allowlist"
-        assert cfg.scanners.r3_llm_manipulation.llm_api is None
         assert cfg.scanners.r4_behavior_drift.repeat_count == 3
 
     def test_quick_yaml(self) -> None:

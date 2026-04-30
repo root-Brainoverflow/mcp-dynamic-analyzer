@@ -72,10 +72,14 @@ class R1DataAccessScanner(BaseScanner):
     async def analyze(self, ctx: AnalysisContext) -> list[Finding]:
         findings: list[Finding] = []
         reader = ctx.event_reader  # type: ignore[union-attr]
+        trusted_ips: set[str] = set()
+        if ctx.static_context:
+            raw = ctx.static_context.get("trusted_internal_ips") or []
+            trusted_ips = {str(ip) for ip in raw}
 
         findings.extend(await self._check_file_access(reader))
         findings.extend(await self._check_honeypot(reader))
-        findings.extend(await self._check_network(reader))
+        findings.extend(await self._check_network(reader, trusted_ips))
 
         return findings
 
@@ -138,12 +142,23 @@ class R1DataAccessScanner(BaseScanner):
 
     # -- network -------------------------------------------------------------
 
-    async def _check_network(self, reader: Any) -> list[Finding]:
+    async def _check_network(
+        self,
+        reader: Any,
+        trusted_ips: set[str],
+    ) -> list[Finding]:
         findings: list[Finding] = []
 
         async for evt in reader.events_by_source("network"):
             dest = evt.data.get("destination", evt.data.get("address", ""))
             if not dest:
+                continue
+
+            # Strip ``host:port`` to compare against the trusted IP set.
+            host = dest.rsplit(":", 1)[0] if dest.count(":") == 1 else dest
+            if host in trusted_ips:
+                # Sidecar / explicitly-trusted address — connection here is
+                # the legitimate redirect we set up, not SSRF.
                 continue
 
             if evt.type == "blocked_connection":
