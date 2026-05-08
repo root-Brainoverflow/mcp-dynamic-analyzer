@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from itertools import groupby
 from typing import Any
 
 import structlog
@@ -35,7 +36,10 @@ from mcp_dynamic_analyzer.payloads import (
     ssrf,
     type_confusion,
 )
-from mcp_dynamic_analyzer.payloads._response_filters import is_validation_rejection
+from mcp_dynamic_analyzer.payloads._response_filters import (
+    is_server_outcome,
+    is_validation_rejection,
+)
 from mcp_dynamic_analyzer.models import ServerCrashError
 from mcp_dynamic_analyzer.protocol.client import McpClient, McpError
 from mcp_dynamic_analyzer.scanners.base import BaseScanner, TestSequence
@@ -69,47 +73,127 @@ class FuzzingSequence(TestSequence):
         return 120.0
 
     async def execute(self, client: Any, writer: EventWriter) -> None:
+        """Breadth-first fuzzing across (depth, category, tool, param).
+
+        Outer loop iterates the **payload index inside each category** so
+        depth=0 visits one payload of every category for every tool before
+        any tool sees its second payload. If the sequence-level timeout
+        fires partway through, every (tool, category) has at least one
+        payload tried — no tool is left untested.
+
+        Categories are kept in risk-priority order so the highest-impact /
+        highest-precision signals (sql_injection, command_injection, rce_*)
+        run before the noisier ones (path_traversal mass, type_confusion
+        variants).
+        """
         cli: McpClient = client
         tools = await cli.list_tools()
+        if not tools:
+            return
 
-        for tool in tools:
-            string_params = _string_param_names(tool)
-            url_params = _url_param_names(tool)
-            obj_params = _object_param_names(tool)
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.timeout * 0.95
 
-            timeout_counts: dict[str, int] = {}
+        # Pre-compute per-tool param sets and per-(tool, category) circuit
+        # breaker state. We use the tool name as a stable key.
+        tool_state: list[dict[str, Any]] = []
+        for t in tools:
+            tool_state.append({
+                "tool": t,
+                "string_params": _string_param_names(t),
+                "url_params": _url_param_names(t),
+                "obj_params": _object_param_names(t),
+                "broken_cats": set(),
+            })
 
-            async def fire(category: str, payload: Any, params: list[str]) -> None:
-                if timeout_counts.get(category, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
+        # Risk-priority payload groups: list of (category, [payload, payload, ...]).
+        string_groups = self._payload_groups("string")
+        url_groups = self._payload_groups("url")
+        obj_groups = self._payload_groups("object")
+
+        max_depth = max(
+            (len(p) for _, p in string_groups + url_groups + obj_groups),
+            default=0,
+        )
+
+        log.info(
+            "fuzz.breadth_first_start",
+            tools=len(tools),
+            max_depth=max_depth,
+            string_categories=len(string_groups),
+            url_categories=len(url_groups),
+            object_categories=len(obj_groups),
+            timeout_sec=self.timeout,
+        )
+
+        for depth in range(max_depth):
+            if loop.time() >= deadline:
+                log.warning(
+                    "fuzz.deadline_hit",
+                    depth_reached=depth,
+                    hint="Sequence budget exhausted — every tool has at least "
+                         f"{depth} payload(s) per category from earlier depths.",
+                )
+                break
+            await self._run_depth(
+                cli, writer, depth, tool_state, string_groups, "string", deadline,
+            )
+            if loop.time() >= deadline: break
+            await self._run_depth(
+                cli, writer, depth, tool_state, url_groups, "url", deadline,
+            )
+            if loop.time() >= deadline: break
+            await self._run_depth(
+                cli, writer, depth, tool_state, obj_groups, "object", deadline,
+            )
+
+    async def _run_depth(
+        self,
+        cli: McpClient,
+        writer: EventWriter,
+        depth: int,
+        tool_state: list[dict[str, Any]],
+        groups: list[tuple[str, list[Any]]],
+        param_kind: str,  # "string" | "url" | "object"
+        deadline: float,
+    ) -> None:
+        """For each category at *depth*, fire its payload at every tool."""
+        loop = asyncio.get_running_loop()
+        param_key = {
+            "string": "string_params",
+            "url": "url_params",
+            "object": "obj_params",
+        }[param_kind]
+        for category, payloads in groups:
+            if depth >= len(payloads):
+                continue
+            if loop.time() >= deadline:
+                return
+            payload = payloads[depth]
+            for state in tool_state:
+                if loop.time() >= deadline:
                     return
+                params = state[param_key]
+                if not params:
+                    continue
+                if category in state["broken_cats"]:
+                    continue
+                tool = state["tool"]
                 for param in params:
+                    if loop.time() >= deadline:
+                        return
                     args: dict[str, Any] = {param: payload}
                     timed_out = await self._fuzz_one(cli, writer, tool.name, category, args)
                     if timed_out:
-                        timeout_counts[category] = timeout_counts.get(category, 0) + 1
-                        if timeout_counts[category] >= _CIRCUIT_BREAKER_THRESHOLD:
-                            log.info(
-                                "fuzz.circuit_breaker_tripped",
-                                tool=tool.name,
-                                category=category,
-                                hint="Skipping remaining payloads in this category for this tool.",
-                            )
-                            return
-
-            # String-typed params → all payload categories, every payload.
-            if string_params:
-                for category, payload in self._build_string_payloads():
-                    await fire(category, payload, string_params)
-
-            # URL-typed string params → full SSRF payload set.
-            if url_params:
-                for category, payload in ssrf.generate_ssrf_payloads():
-                    await fire(category, payload, url_params)
-
-            # Object/any params → full NoSQL operator set.
-            if obj_params:
-                for category, payload in nosql_injection.generate_nosql_payloads():
-                    await fire(category, payload, obj_params)
+                        state["broken_cats"].add(category)
+                        log.info(
+                            "fuzz.circuit_breaker_tripped",
+                            tool=tool.name,
+                            category=category,
+                            depth=depth,
+                            hint="Skipping remaining payloads in this category for this tool.",
+                        )
+                        break
 
     async def _fuzz_one(
         self,
@@ -132,26 +216,40 @@ class FuzzingSequence(TestSequence):
         ))
 
         timed_out = False
-        try:
-            result = await asyncio.wait_for(
-                cli.call_tool(tool_name, arguments), timeout=_CALL_TIMEOUT
-            )
-            resp_text = _safe_dump(result)
-        except ServerCrashError:
-            raise  # propagate immediately — do not record a fake test_result
-        except asyncio.TimeoutError:
-            resp_text = f"CallTimeout: no response within {_CALL_TIMEOUT:.0f}s"
-            timed_out = True
-            log.warning(
-                "fuzz.call_timeout",
-                tool=tool_name,
-                category=category,
-                timeout=_CALL_TIMEOUT,
-            )
-        except McpError as e:
-            resp_text = f"McpError({e.code}): {e.message}"
-        except Exception as e:
-            resp_text = f"Exception: {e}"
+        outcome: str
+        # Refuse to send anything that wouldn't survive RFC 8259 — Python's
+        # default ``json.dumps`` emits ``Infinity`` / ``NaN`` literals that
+        # the server can't parse, which used to surface as a 15 s phantom
+        # timeout misclassified as a hang.
+        encoding_error = _json_encoding_error(arguments)
+        if encoding_error is not None:
+            resp_text = f"ClientSerializationError: {encoding_error}"
+            outcome = "client_serialization"
+        else:
+            try:
+                result = await asyncio.wait_for(
+                    cli.call_tool(tool_name, arguments), timeout=_CALL_TIMEOUT
+                )
+                resp_text = _safe_dump(result)
+                outcome = "server_response"
+            except ServerCrashError:
+                raise  # propagate immediately — do not record a fake test_result
+            except asyncio.TimeoutError:
+                resp_text = f"CallTimeout: no response within {_CALL_TIMEOUT:.0f}s"
+                timed_out = True
+                outcome = "client_timeout"
+                log.warning(
+                    "fuzz.call_timeout",
+                    tool=tool_name,
+                    category=category,
+                    timeout=_CALL_TIMEOUT,
+                )
+            except McpError as e:
+                resp_text = f"McpError({e.code}): {e.message}"
+                outcome = "server_error"
+            except Exception as e:
+                resp_text = f"Exception: {e}"
+                outcome = "client_exception"
 
         await writer.write(Event(
             session_id=self._session_id,
@@ -162,23 +260,73 @@ class FuzzingSequence(TestSequence):
                 "tool": tool_name,
                 "category": category,
                 "response_preview": resp_text[:2000],
+                # Distinguishes server-originated content from our own
+                # wrapper text (timeouts, serialisation errors, ...). Indicator
+                # matching MUST only run on server-sourced outcomes — otherwise
+                # our ``ClientSerializationError: ValueError: ...`` wrapper
+                # itself trips the ``valueerror`` indicator.
+                "outcome": outcome,
             },
         ))
         return timed_out
 
+    def _payload_groups(self, kind: str) -> list[tuple[str, list[Any]]]:
+        """Return ``[(category, [payloads...]), ...]`` in priority order.
+
+        Grouping by category lets the breadth-first executor run one payload
+        per category at depth=0, then a second one at depth=1, etc., so a
+        partial run still tests every category for every tool.
+        """
+        if kind == "string":
+            flat = self._build_string_payloads()
+        elif kind == "url":
+            flat = list(ssrf.generate_ssrf_payloads())
+        elif kind == "object":
+            flat = list(nosql_injection.generate_nosql_payloads())
+        else:
+            return []
+        # ``groupby`` preserves the input order, which is the priority order.
+        groups: list[tuple[str, list[Any]]] = []
+        for cat, items in groupby(flat, key=lambda x: x[0]):
+            groups.append((cat, [p for _, p in items]))
+        return groups
+
     def _build_string_payloads(self) -> list[tuple[str, Any]]:
-        """Return ``(category, value)`` pairs for all string-targeted payload modules."""
+        """Return ``(category, value)`` pairs in **risk-priority order**.
+
+        Categories are ordered so that the highest-impact / highest-precision
+        signals run first within each tool's time budget. If a tool's budget
+        is exhausted partway through, the categories most likely to surface
+        a real finding have already been tested.
+
+        Order rationale:
+          1. ``sql_injection``     — high precision (postgres / mysql error
+             patterns are unambiguous), critical impact for DB-bound MCPs.
+          2. ``command_injection`` — broadly applicable, ``uid=`` / ``uname``
+             output indicators are unambiguous.
+          3. ``rce_*``             — catastrophic when present; canary echo
+             is high precision after the response-filter cleanup.
+          4. ``path_traversal``    — broad coverage but many payloads (~70)
+             so it would otherwise hog the time budget.
+          5. ``type_confusion``    — many payloads, mostly noise (Pydantic
+             rejection); run late so it doesn't crowd out the others.
+          6. ``nosql_sql_like``    — niche.
+        """
         out: list[tuple[str, Any]] = []
-        for p in path_traversal.ALL_PAYLOADS:
-            out.append(("path_traversal", p))
-        for p in command_injection.PAYLOADS:
-            out.append(("command_injection", p))
+        # 1. SQL injection
         for p in sql_injection.PAYLOADS:
             out.append(("sql_injection", p))
-        out.extend(type_confusion.generate_type_payloads())
-        # RCE / SSTI probes also delivered as strings.
+        # 2. Command injection
+        for p in command_injection.PAYLOADS:
+            out.append(("command_injection", p))
+        # 3. RCE family (SSTI, eval sinks, JNDI, deserialise, YAML load, ...)
         out.extend(rce.generate_rce_payloads())
-        # NoSQL string-form operator smuggling (e.g. "[$ne]=x").
+        # 4. Path traversal (large set)
+        for p in path_traversal.ALL_PAYLOADS:
+            out.append(("path_traversal", p))
+        # 5. Type confusion (largest set, lowest signal-to-noise)
+        out.extend(type_confusion.generate_type_payloads())
+        # 6. NoSQL operator smuggling
         for p in nosql_injection.SQL_LIKE_NOSQL:
             out.append(("nosql_sql_like", p))
         return out
@@ -213,8 +361,9 @@ class R5InputValidationScanner(BaseScanner):
             cat = evt.data.get("category", "")
             resp = evt.data.get("response_preview", "")
             tool = evt.data.get("tool", "")
+            outcome = evt.data.get("outcome")  # None for legacy events
 
-            finding = self._check(cat, resp, tool, evt.event_id)
+            finding = self._check(cat, resp, tool, evt.event_id, outcome)
             if finding:
                 findings.append(finding)
 
@@ -226,7 +375,19 @@ class R5InputValidationScanner(BaseScanner):
         response: str,
         tool_name: str,
         event_id: str,
+        outcome: str | None = None,
     ) -> Finding | None:
+
+        # Indicator matching is only meaningful on text the server actually
+        # produced. ``client_serialization`` / ``client_timeout`` /
+        # ``client_exception`` carry text we wrote ourselves (wrappers like
+        # ``ClientSerializationError: ValueError: ...``) — letting them
+        # through would falsely match e.g. the ``valueerror`` indicator on
+        # our own message. For legacy events with no ``outcome`` field the
+        # helper falls back to checking ``response`` for known client-wrapper
+        # prefixes.
+        if not is_server_outcome(outcome, response):
+            return None
 
         # Schema-level rejection short-circuit. Pydantic/JSONSchema responses
         # echo the rejected input verbatim, which falsely matches every
@@ -383,3 +544,20 @@ def _safe_dump(obj: Any) -> str:
         return json.dumps(obj, ensure_ascii=False, default=str)
     except (TypeError, ValueError):
         return str(obj)
+
+
+def _json_encoding_error(obj: Any) -> str | None:
+    """Return an error message if *obj* can't be sent on the JSON-RPC wire.
+
+    Mirrors the gate in R6 (``r6_stability._json_encoding_error``). Uses
+    ``allow_nan=False`` to catch ``float('inf')`` / ``NaN`` here so the
+    fuzzer records a ``ClientSerializationError`` instead of letting the
+    payload reach the wire as an ``Infinity`` literal — which Node-side
+    JSON.parse rejects, producing a 15 s phantom timeout that misclassifies
+    as a server hang.
+    """
+    try:
+        json.dumps(obj, ensure_ascii=False, allow_nan=False)
+        return None
+    except (TypeError, ValueError, OverflowError, RecursionError) as exc:
+        return f"{type(exc).__name__}: {exc}"

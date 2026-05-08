@@ -47,10 +47,18 @@ _MYSQL_NEAR_ECHO_RE = re.compile(
     r"near '[^']*' at line \d+",
 )
 
+# Hand-written enum validation: ``Invalid <field> provided: '<payload>'.``
+# Strip the quoted payload so RCE / SQL indicators inside don't leak through
+# to the success heuristics.
+_ENUM_INVALID_ECHO_RE = re.compile(
+    r"[Ii]nvalid\s+[^:]+?:\s*'[^']*'",
+)
+
 # Substrings that mean "the server refused this input before doing anything
 # observable". If any appears, the canary / RCE indicator that came along with
 # the payload is reflection, not execution.
 _VALIDATION_REJECTION_MARKERS: tuple[str, ...] = (
+    # Pydantic
     "validation error for",
     "field required",
     "type=missing",
@@ -58,13 +66,25 @@ _VALIDATION_REJECTION_MARKERS: tuple[str, ...] = (
     "value_error",
     "pydantic.error",
     "errors.pydantic.dev",
+    "input should be",      # pydantic v2 phrasing
+    # jsonschema
     "jsonschemavalidationerror",
     "schema validation",
     "validationerror",
     "extra fields not permitted",
     "value is not a valid",
-    "input should be",      # pydantic v2 phrasing
     "missing required",
+    # Generic / hand-written enum validation messages.
+    # Servers like crystaldba/postgres-mcp's ``analyze_db_health`` echo
+    # the rejected payload back inside ``Invalid X provided: '<payload>'.
+    # Valid values are: ...`` style errors, which then false-matches every
+    # RCE / command-injection / SQL indicator in the payload.
+    "valid values are",
+    "valid options are",
+    "must be one of",
+    "please try again",
+    "invalid sort criteria",
+    "invalid health type",
 )
 
 
@@ -90,4 +110,39 @@ def strip_input_echoes(response_text: str) -> str:
     out = _JSONSCHEMA_INSTANCE_RE.sub("instance: <redacted>", out)
     out = _POSTGRES_QUERY_ECHO_RE.sub("LINE <redacted>", out)
     out = _MYSQL_NEAR_ECHO_RE.sub("near <redacted>", out)
+    out = _ENUM_INVALID_ECHO_RE.sub("Invalid <redacted>", out)
     return out
+
+
+# Outcomes whose ``response_preview`` is text the server actually produced.
+# Indicator matching (RCE / SSTI / OOM / traceback / ...) is only meaningful
+# on these. Running it on client-side wrappers (``ClientSerializationError:
+# ValueError: ...``) would falsely match indicators in our own message —
+# which is exactly the bug that produced 18 phantom R5 findings on
+# playwright-mcp in session ses-32f4a3fd.
+_SERVER_OUTCOMES = frozenset({"server_response", "server_error"})
+
+
+_LEGACY_CLIENT_PREFIXES = (
+    "ClientSerializationError:",
+    "CallTimeout:",
+    "Exception:",
+)
+
+
+def is_server_outcome(outcome: str | None, response: str = "") -> bool:
+    """True iff the response text was sent by the server.
+
+    For events written by current code, ``outcome`` is the source of truth.
+    Legacy events (no ``outcome`` field) fall back to scanning the response
+    prefix for known client-side wrapper markers — ``ClientSerializationError:``,
+    ``CallTimeout:``, ``Exception:`` — so re-analysing old session logs
+    doesn't suddenly produce phantom findings on our own wrapper text.
+    """
+    if outcome is not None:
+        return outcome in _SERVER_OUTCOMES
+    # Legacy compat path.
+    for prefix in _LEGACY_CLIENT_PREFIXES:
+        if response.startswith(prefix):
+            return False
+    return True

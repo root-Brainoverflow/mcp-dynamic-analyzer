@@ -695,9 +695,18 @@ class Sandbox:
             # 100 MB tmpfs is too tight for typical python servers (psycopg2,
             # mcp-sdk, etc.) and forces uv to fail with ENOSPC.
             tmpfs_size = "512m" if is_package_runner else "100m"
+            # Docker mounts ``--tmpfs`` with ``noexec`` by default. That blocks
+            # ``npx`` from running entry-point scripts it just installed under
+            # ``/tmp/.npm/_npx/...`` (``sh: playwright-mcp: Permission denied``).
+            # Add the ``exec`` option only for package runners — they need it
+            # to launch their freshly-installed binaries — and keep noexec for
+            # the rest, where /tmp should never host an executable.
+            tmpfs_opts = f"size={tmpfs_size}"
+            if is_package_runner:
+                tmpfs_opts += ",exec"
             cmd += [
                 "--read-only",
-                "--tmpfs", f"/tmp:size={tmpfs_size}",
+                "--tmpfs", f"/tmp:{tmpfs_opts}",
                 "--security-opt", "no-new-privileges",
                 "--cap-drop", "ALL",
             ]

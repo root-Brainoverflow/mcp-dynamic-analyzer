@@ -29,6 +29,7 @@ from mcp_dynamic_analyzer.models import (
     Severity,
     ToolInfo,
 )
+from mcp_dynamic_analyzer.payloads._response_filters import is_server_outcome
 from mcp_dynamic_analyzer.payloads.stability import (
     SLOW_RESPONSE_THRESHOLD_SEC,
     generate_stability_payloads,
@@ -132,21 +133,25 @@ class StabilityFuzzingSequence(TestSequence):
         ))
 
         resp_text: str
+        outcome: str
         timed_out = False
         encoding_error = _json_encoding_error(arguments)
         if encoding_error is not None:
             resp_text = f"ClientSerializationError: {encoding_error}"
+            outcome = "client_serialization"
         else:
             try:
                 result = await asyncio.wait_for(
                     cli.call_tool(tool_name, arguments), timeout=_CALL_TIMEOUT
                 )
                 resp_text = _safe_dump(result)
+                outcome = "server_response"
             except ServerCrashError:
                 raise  # propagate immediately — do not record a fake test_result
             except asyncio.TimeoutError:
                 resp_text = f"CallTimeout: no response within {_CALL_TIMEOUT:.0f}s"
                 timed_out = True
+                outcome = "client_timeout"
                 log.warning(
                     "fuzz.call_timeout",
                     tool=tool_name,
@@ -155,8 +160,10 @@ class StabilityFuzzingSequence(TestSequence):
                 )
             except McpError as e:
                 resp_text = f"McpError({e.code}): {e.message}"
+                outcome = "server_error"
             except Exception as e:
                 resp_text = f"Exception: {e}"
+                outcome = "client_exception"
 
         await writer.write(Event(
             session_id=self._session_id,
@@ -167,6 +174,7 @@ class StabilityFuzzingSequence(TestSequence):
                 "tool": tool_name,
                 "category": category,
                 "response_preview": resp_text[:2000],
+                "outcome": outcome,
             },
         ))
         return timed_out
@@ -269,12 +277,34 @@ class R6StabilityScanner(BaseScanner):
             if evt.data.get("sequence") != "fuzz_stability":
                 continue
             resp = evt.data.get("response_preview", "")
-            # Client couldn't serialize arguments — server never received this payload.
-            # Matching indicators against client-side errors produces false positives.
-            if resp.startswith("ClientSerializationError:"):
-                continue
+            outcome = evt.data.get("outcome")  # None for legacy events
             tool = evt.data.get("tool", "")
             cat = evt.data.get("category", "")
+
+            # ``client_timeout`` means the server never sent a response — emit
+            # the hang finding directly without inspecting the wrapper text.
+            # ``looks_like_timeout`` on legacy events still catches the same
+            # case via the ``CallTimeout:`` substring fallback below.
+            if outcome == "client_timeout":
+                findings.append(Finding(
+                    risk_type=RiskType.R6,
+                    severity=Severity.MEDIUM,
+                    confidence=0.7,
+                    title=f"Timeout / hang on category '{cat}' for tool '{tool}'",
+                    description=f"Payload in category '{cat}' caused the server to time out.",
+                    related_events=[evt.event_id],
+                    tool_name=tool,
+                    reproduction=f"Send '{cat}' payload to tool '{tool}'",
+                ))
+                continue
+
+            # Other client-side outcomes (serialisation failure, generic
+            # exceptions) carry text we wrote ourselves. Indicator matching
+            # would falsely fire on our wrapper, so skip them entirely. The
+            # response argument lets legacy events (no ``outcome``) fall
+            # back to prefix-based detection.
+            if not is_server_outcome(outcome, resp):
+                continue
 
             if looks_like_oom(resp):
                 findings.append(Finding(
@@ -353,8 +383,16 @@ def _safe_dump(obj: Any) -> str:
 
 
 def _json_encoding_error(obj: Any) -> str | None:
+    """Return an error message if *obj* cannot be sent on the JSON-RPC wire.
+
+    Uses ``allow_nan=False`` so that ``float('inf')`` / ``float('-inf')`` /
+    ``float('nan')`` are caught here instead of slipping through to the
+    interceptor — which would emit ``Infinity`` / ``NaN`` literals (invalid
+    per RFC 8259) and the server would fail to parse, producing a phantom
+    15 s timeout that R6 used to misreport as a real hang.
+    """
     try:
-        json.dumps(obj, ensure_ascii=False)
+        json.dumps(obj, ensure_ascii=False, allow_nan=False)
         return None
     except (TypeError, ValueError, OverflowError, RecursionError) as exc:
         return f"{type(exc).__name__}: {exc}"

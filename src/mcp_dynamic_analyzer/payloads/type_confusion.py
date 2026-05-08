@@ -232,8 +232,13 @@ ERROR_INDICATORS: list[str] = [
     "unicodedecodeerror",
     "unicodeencodeerror",
     "json.decoder.jsondecodeerror",
-    "pydantic",
-    "validationerror",
+    # NOTE: ``pydantic`` and ``validationerror`` were removed because MCP
+    # frameworks return *handled* Pydantic rejections as
+    # ``{"isError": true, "content": [..."1 validation error for ..."...]}``,
+    # which matched both substrings and fired this heuristic on every fuzz
+    # call with a wrong-typed argument. A genuine unhandled Pydantic leak
+    # always carries a Python traceback, so the ``traceback`` indicator
+    # above still catches the real unhandled case.
 
     # Node / JS
     "referenceerror",
@@ -274,6 +279,14 @@ ERROR_INDICATORS: list[str] = [
 
 
 def looks_like_unhandled_error(response_text: str) -> bool:
-    """Heuristic: does the response contain an unhandled exception or crash trace?"""
-    lower = response_text.lower()
+    """Heuristic: does the response contain an unhandled exception or crash trace?
+
+    Strip framework input echoes first so payloads that contain JVM-style
+    or Python-style class paths (e.g. ``java.lang.Runtime`` SSTI payloads,
+    ``__import__('os')`` snippets) don't false-match indicators when those
+    payloads merely get reflected back inside a postgres ``LINE 1: ...``
+    syntax-error echo or a Pydantic ``input_value=...`` block.
+    """
+    from mcp_dynamic_analyzer.payloads._response_filters import strip_input_echoes
+    lower = strip_input_echoes(response_text).lower()
     return any(ind in lower for ind in ERROR_INDICATORS)

@@ -98,8 +98,13 @@ _RESPONSE_PATTERNS: list[tuple[str, re.Pattern[str], str]] = [
     (
         "tool_return_instruction",
         re.compile(
-            r"(now\s+(call|execute|run|use)\s+|please\s+(call|execute|run|use)\s+|"
-            r"next\s*,?\s*(call|execute|run|use)|you\s+should\s+(now\s+)?(call|run))",
+            # ``use`` is intentionally excluded from the action-verb set
+            # because legitimate enum-validation hints often contain phrases
+            # like "Please use 'resources' or 'mean_time'", which is
+            # documentation rather than tool-chain manipulation. ``call`` /
+            # ``execute`` / ``run`` are stronger signals.
+            r"(now\s+(call|execute|run)\s+|please\s+(call|execute|run)\s+|"
+            r"next\s*,?\s*(call|execute|run)|you\s+should\s+(now\s+)?(call|run))",
             re.IGNORECASE,
         ),
         "HIGH",

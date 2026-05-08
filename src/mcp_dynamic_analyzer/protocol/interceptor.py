@@ -18,6 +18,36 @@ from mcp_dynamic_analyzer.models import Event, ServerCrashError
 log = structlog.get_logger()
 
 
+class ClientSerializationError(Exception):
+    """Raised when a fuzz payload cannot be serialised as valid JSON.
+
+    Distinguishes "we never managed to send the request" from "the server
+    didn't respond". Without this, payloads containing ``float('inf')`` /
+    ``NaN`` (which Python's default ``json.dumps`` emits as the literals
+    ``Infinity`` / ``NaN`` — invalid per RFC 8259) silently produce malformed
+    wire content the server can't parse, causing a 15 s phantom timeout that
+    the R6 stability scanner misreports as a real DoS hang.
+    """
+
+
+def _consume_exception(fut: asyncio.Future[Any]) -> None:
+    """Mark a Future's exception as retrieved to suppress GC warnings.
+
+    When the server stream closes mid-scan (global timeout, crash) we
+    set ConnectionError / ServerCrashError on every pending Future. If the
+    original awaiter was already cancelled by ``asyncio.wait_for`` it never
+    consumes the exception, and Python's GC prints
+    ``Future exception was never retrieved`` for each one. Reading
+    ``fut.exception()`` here clears the ``_log_traceback`` flag so the
+    warning is suppressed; if a live awaiter does retrieve the future it
+    still sees the exception raised on ``await``.
+    """
+    try:
+        fut.exception()
+    except (asyncio.CancelledError, asyncio.InvalidStateError):
+        pass
+
+
 class StdioInterceptor:
     """Bidirectional JSON-RPC proxy over a subprocess's stdin/stdout.
 
@@ -67,6 +97,7 @@ class StdioInterceptor:
         for fut in self._pending.values():
             if not fut.done():
                 fut.set_exception(ConnectionError("interceptor closed"))
+                _consume_exception(fut)
         self._pending.clear()
 
     # -- sending (client → server) -------------------------------------------
@@ -108,7 +139,29 @@ class StdioInterceptor:
     async def _write_to_server(self, msg: dict[str, Any], *, direction: str) -> None:
         # Keep wire payload ASCII-safe so lone-surrogate fuzz strings survive
         # transport as ``\uXXXX`` escapes instead of crashing UTF-8 encoding.
-        raw = json.dumps(msg, ensure_ascii=True)
+        # ``allow_nan=False`` rejects ``Infinity`` / ``-Infinity`` / ``NaN`` —
+        # Python's default would emit those literals which are NOT valid JSON
+        # (RFC 8259) and break the server's parser, producing a 15 s phantom
+        # hang that our R6 scanner used to misreport as a real DoS.
+        try:
+            raw = json.dumps(msg, ensure_ascii=True, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            # Pop the pending future so its waiter doesn't hang for the full
+            # request timeout, then surface a typed error so callers can
+            # classify the result as a client-side serialisation failure
+            # rather than a server hang.
+            req_id = msg.get("id")
+            if req_id is not None:
+                fut = self._pending.pop(req_id, None)
+                if fut is not None and not fut.done():
+                    err = ClientSerializationError(
+                        f"payload not representable as valid JSON: {exc}"
+                    )
+                    fut.set_exception(err)
+                    _consume_exception(fut)
+            raise ClientSerializationError(
+                f"payload not representable as valid JSON: {exc}"
+            ) from exc
         self._stdin.write((raw + "\n").encode())
         await self._stdin.drain()
         await self._record(msg, direction=direction)
@@ -142,6 +195,7 @@ class StdioInterceptor:
             for fut in self._pending.values():
                 if not fut.done():
                     fut.set_exception(exc)
+                    _consume_exception(fut)
             self._pending.clear()
 
     def _dispatch(self, msg: dict[str, Any]) -> None:
