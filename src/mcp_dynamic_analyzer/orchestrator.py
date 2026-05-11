@@ -274,6 +274,16 @@ async def _collect(
         )
 
         while remaining:
+            # Every fresh sandbox spawn = fresh server process with no MCP
+            # protocol state. The JSON-RPC ``initialize`` handshake must run
+            # before any ``tools/call`` will be accepted (servers respond
+            # with ``-32602 Invalid request parameters`` and ``Received
+            # request before initialization was complete``). On retry after
+            # a ServerCrashError, ``remaining`` typically starts with the
+            # sequence that crashed (e.g. ``fuzz_input_validation``) —
+            # prepend InitSequence so the new server gets re-initialised.
+            if not isinstance(remaining[0], InitSequence):
+                remaining = [InitSequence(session_id), *remaining]
             monitors: list[Any] = []
             async with Sandbox(
                 config.server,

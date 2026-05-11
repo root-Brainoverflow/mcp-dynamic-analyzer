@@ -39,6 +39,7 @@ from mcp_dynamic_analyzer.payloads import (
 from mcp_dynamic_analyzer.payloads._response_filters import (
     is_server_outcome,
     is_validation_rejection,
+    strip_payload_echo,
 )
 from mcp_dynamic_analyzer.models import ServerCrashError
 from mcp_dynamic_analyzer.protocol.client import McpClient, McpError
@@ -266,6 +267,12 @@ class FuzzingSequence(TestSequence):
                 # our ``ClientSerializationError: ValueError: ...`` wrapper
                 # itself trips the ``valueerror`` indicator.
                 "outcome": outcome,
+                # Payload value as the analysis phase will see it — used by
+                # ``response_echoes_payload`` to detect generic reflection
+                # FPs (server rejects bad input by echoing it back, the echo
+                # carries our canary / RCE-string straight into indicator
+                # matching). Server-agnostic: works for any phrasing.
+                "payload_repr": _payload_repr(arguments),
             },
         ))
         return timed_out
@@ -362,8 +369,9 @@ class R5InputValidationScanner(BaseScanner):
             resp = evt.data.get("response_preview", "")
             tool = evt.data.get("tool", "")
             outcome = evt.data.get("outcome")  # None for legacy events
+            payload_repr = evt.data.get("payload_repr", "")  # "" for legacy events
 
-            finding = self._check(cat, resp, tool, evt.event_id, outcome)
+            finding = self._check(cat, resp, tool, evt.event_id, outcome, payload_repr)
             if finding:
                 findings.append(finding)
 
@@ -376,6 +384,7 @@ class R5InputValidationScanner(BaseScanner):
         tool_name: str,
         event_id: str,
         outcome: str | None = None,
+        payload_repr: str = "",
     ) -> Finding | None:
 
         # Indicator matching is only meaningful on text the server actually
@@ -389,6 +398,14 @@ class R5InputValidationScanner(BaseScanner):
         if not is_server_outcome(outcome, response):
             return None
 
+        # Mask the original payload inside the response before indicator
+        # matching. Any indicator that survives the mask is server-produced
+        # (real exploit output) rather than a literal echo of what we sent.
+        # Indicators ONLY appearing inside the echoed payload — the common
+        # "server rejected my input and reflected it" pattern — get masked
+        # out and stop matching.
+        masked = strip_payload_echo(response, payload_repr)
+
         # Schema-level rejection short-circuit. Pydantic/JSONSchema responses
         # echo the rejected input verbatim, which falsely matches every
         # success heuristic below. The unhandled-error check at the bottom
@@ -396,7 +413,7 @@ class R5InputValidationScanner(BaseScanner):
         # *handled* error (structured response, not stack trace).
         rejected = is_validation_rejection(response)
 
-        if not rejected and category == "path_traversal" and path_traversal.looks_like_traversal_success(response):
+        if not rejected and category == "path_traversal" and path_traversal.looks_like_traversal_success(masked):
             return Finding(
                 risk_type=RiskType.R5,
                 severity=Severity.CRITICAL,
@@ -408,7 +425,7 @@ class R5InputValidationScanner(BaseScanner):
                 reproduction=f"Call tool '{tool_name}' with a path-traversal payload",
             )
 
-        if not rejected and category == "command_injection" and command_injection.looks_like_injection_success(response):
+        if not rejected and category == "command_injection" and command_injection.looks_like_injection_success(masked):
             return Finding(
                 risk_type=RiskType.R5,
                 severity=Severity.CRITICAL,
@@ -420,7 +437,7 @@ class R5InputValidationScanner(BaseScanner):
                 reproduction=f"Call tool '{tool_name}' with a command-injection payload",
             )
 
-        if category == "sql_injection" and sql_injection.looks_like_sql_error(response):
+        if category == "sql_injection" and sql_injection.looks_like_sql_error(masked):
             return Finding(
                 risk_type=RiskType.R5,
                 severity=Severity.HIGH,
@@ -432,7 +449,7 @@ class R5InputValidationScanner(BaseScanner):
                 reproduction=f"Call tool '{tool_name}' with a SQL-injection payload",
             )
 
-        if not rejected and category.startswith("ssrf_") and ssrf.looks_like_ssrf_success(response):
+        if not rejected and category.startswith("ssrf_") and ssrf.looks_like_ssrf_success(masked):
             return Finding(
                 risk_type=RiskType.R5,
                 severity=Severity.CRITICAL,
@@ -445,7 +462,7 @@ class R5InputValidationScanner(BaseScanner):
             )
 
         if not rejected and (category.startswith("nosql_") or category == "nosql_sql_like"):
-            if nosql_injection.looks_like_nosql_error(response):
+            if nosql_injection.looks_like_nosql_error(masked):
                 return Finding(
                     risk_type=RiskType.R5,
                     severity=Severity.HIGH,
@@ -456,7 +473,7 @@ class R5InputValidationScanner(BaseScanner):
                     tool_name=tool_name,
                     reproduction=f"Call tool '{tool_name}' with a NoSQL operator payload",
                 )
-            if nosql_injection.looks_like_nosql_leak(response):
+            if nosql_injection.looks_like_nosql_leak(masked):
                 return Finding(
                     risk_type=RiskType.R5,
                     severity=Severity.CRITICAL,
@@ -472,7 +489,7 @@ class R5InputValidationScanner(BaseScanner):
             "ssti", "eval_python", "eval_js", "eval_ruby", "eval_php", "eval_perl",
             "expr_lang", "jndi", "deserialize", "yaml_load", "xxe",
         )):
-            if rce.looks_like_rce_success(response):
+            if rce.looks_like_rce_success(masked):
                 return Finding(
                     risk_type=RiskType.R2,
                     severity=Severity.CRITICAL,
@@ -485,7 +502,7 @@ class R5InputValidationScanner(BaseScanner):
                 )
 
         # Type-confusion: all categories including new ones.
-        if type_confusion.looks_like_unhandled_error(response):
+        if type_confusion.looks_like_unhandled_error(masked):
             return Finding(
                 risk_type=RiskType.R5,
                 severity=Severity.MEDIUM,
@@ -544,6 +561,26 @@ def _safe_dump(obj: Any) -> str:
         return json.dumps(obj, ensure_ascii=False, default=str)
     except (TypeError, ValueError):
         return str(obj)
+
+
+def _payload_repr(arguments: dict[str, Any]) -> str:
+    """Stable string of the payload values for substring reflection check.
+
+    We strip the ``{"<param>":`` wrapper because the response usually echoes
+    only the inner *value* (e.g. ``Repository path '<value>' is outside``),
+    not the full key+value JSON. Joining values with a separator keeps
+    multi-param payloads searchable too.
+    """
+    parts: list[str] = []
+    for v in arguments.values():
+        if isinstance(v, str):
+            parts.append(v)
+        else:
+            try:
+                parts.append(json.dumps(v, ensure_ascii=False, default=str))
+            except (TypeError, ValueError):
+                parts.append(str(v))
+    return "\n".join(parts)[:4000]
 
 
 def _json_encoding_error(obj: Any) -> str | None:

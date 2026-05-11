@@ -29,7 +29,10 @@ from mcp_dynamic_analyzer.models import (
     Severity,
     ToolInfo,
 )
-from mcp_dynamic_analyzer.payloads._response_filters import is_server_outcome
+from mcp_dynamic_analyzer.payloads._response_filters import (
+    is_server_outcome,
+    strip_payload_echo,
+)
 from mcp_dynamic_analyzer.payloads.stability import (
     SLOW_RESPONSE_THRESHOLD_SEC,
     generate_stability_payloads,
@@ -175,6 +178,7 @@ class StabilityFuzzingSequence(TestSequence):
                 "category": category,
                 "response_preview": resp_text[:2000],
                 "outcome": outcome,
+                "payload_repr": _payload_repr(arguments),
             },
         ))
         return timed_out
@@ -306,7 +310,14 @@ class R6StabilityScanner(BaseScanner):
             if not is_server_outcome(outcome, resp):
                 continue
 
-            if looks_like_oom(resp):
+            # Mask payload echoes so reflected payload syntax doesn't
+            # falsely trigger OOM / stack-overflow indicators. A real
+            # server-side failure leaves error text OUTSIDE the masked
+            # echo region and still matches.
+            payload_repr = evt.data.get("payload_repr", "")
+            masked = strip_payload_echo(resp, payload_repr)
+
+            if looks_like_oom(masked):
                 findings.append(Finding(
                     risk_type=RiskType.R6,
                     severity=Severity.HIGH,
@@ -317,7 +328,7 @@ class R6StabilityScanner(BaseScanner):
                     tool_name=tool,
                     reproduction=f"Send '{cat}' payload to tool '{tool}'",
                 ))
-            elif looks_like_stack_overflow(resp):
+            elif looks_like_stack_overflow(masked):
                 findings.append(Finding(
                     risk_type=RiskType.R6,
                     severity=Severity.HIGH,
@@ -328,7 +339,7 @@ class R6StabilityScanner(BaseScanner):
                     tool_name=tool,
                     reproduction=f"Send deeply-nested '{cat}' payload to tool '{tool}'",
                 ))
-            elif looks_like_parser_failure(resp):
+            elif looks_like_parser_failure(masked):
                 findings.append(Finding(
                     risk_type=RiskType.R6,
                     severity=Severity.MEDIUM,
@@ -339,7 +350,7 @@ class R6StabilityScanner(BaseScanner):
                     tool_name=tool,
                     reproduction=f"Send '{cat}' bomb payload to tool '{tool}'",
                 ))
-            elif looks_like_crash(resp):
+            elif looks_like_crash(masked):
                 findings.append(Finding(
                     risk_type=RiskType.R6,
                     severity=Severity.CRITICAL,
@@ -380,6 +391,25 @@ def _safe_dump(obj: Any) -> str:
     except (TypeError, ValueError, OverflowError, RecursionError):
         text = _REPR.repr(obj)
     return _truncate_preview(text)
+
+
+def _payload_repr(arguments: dict[str, Any]) -> str:
+    """Stable string of payload values for ``response_echoes_payload``.
+
+    See ``r5_input_validation._payload_repr`` for rationale: we want only
+    the *values* (what the server typically echoes), not the full
+    ``{"<param>": ...}`` JSON wrapper.
+    """
+    parts: list[str] = []
+    for v in arguments.values():
+        if isinstance(v, str):
+            parts.append(v)
+        else:
+            try:
+                parts.append(json.dumps(v, ensure_ascii=False, default=str))
+            except (TypeError, ValueError, OverflowError, RecursionError):
+                parts.append(_REPR.repr(v))
+    return "\n".join(parts)[:4000]
 
 
 def _json_encoding_error(obj: Any) -> str | None:

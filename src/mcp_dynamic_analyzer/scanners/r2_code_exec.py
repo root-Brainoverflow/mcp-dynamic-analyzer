@@ -18,7 +18,11 @@ from mcp_dynamic_analyzer.models import (
     RiskType,
     Severity,
 )
-from mcp_dynamic_analyzer.payloads._response_filters import is_validation_rejection
+from mcp_dynamic_analyzer.payloads._response_filters import (
+    is_server_outcome,
+    is_validation_rejection,
+    strip_payload_echo,
+)
 from mcp_dynamic_analyzer.payloads.rce import looks_like_rce_success
 from mcp_dynamic_analyzer.scanners.base import BaseScanner
 
@@ -105,11 +109,21 @@ class R2CodeExecScanner(BaseScanner):
             resp = evt.data.get("response_preview", "")
             if not resp:
                 continue
+            # Skip client-side wrappers (timeout / serialisation error / ...) —
+            # those carry text we wrote ourselves, not server output.
+            outcome = evt.data.get("outcome")
+            if not is_server_outcome(outcome, resp):
+                continue
             # If the server rejected the payload at the validation layer,
             # any RCE-looking string in the response is just payload reflection.
             if is_validation_rejection(resp):
                 continue
-            if looks_like_rce_success(resp):
+            # Mask payload echoes so reflected canaries don't count as RCE.
+            # A real RCE produces command output OUTSIDE the echo region,
+            # which survives the mask and still fires the check.
+            payload_repr = evt.data.get("payload_repr", "")
+            masked = strip_payload_echo(resp, payload_repr)
+            if looks_like_rce_success(masked):
                 tool = evt.data.get("tool", "unknown")
                 cat = evt.data.get("category", "")
                 findings.append(Finding(

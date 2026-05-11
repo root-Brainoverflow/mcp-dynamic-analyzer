@@ -346,6 +346,193 @@ def test_r5_check_processes_server_error_outcome() -> None:
     assert "Unhandled error" in result.title
 
 
+# ---- generic payload-echo reflection guard (server-agnostic) ---------------
+# Replaces per-server hardcoded markers / regexes. The core principle: if the
+# server's response contains the original payload verbatim, every indicator
+# in it came from the payload, not from real exploitation.
+
+
+def test_response_echoes_payload_catches_mcp_server_git_path_scope() -> None:
+    """mcp-server-git emits ``Repository path 'X' is outside ...`` errors that
+    echo the payload value. No marker hard-coding needed — the generic check
+    sees the payload substring in the response."""
+    from mcp_dynamic_analyzer.payloads._response_filters import response_echoes_payload
+    payload = "__import__('os').system('echo RCE_CANARY_7f3a9c')"
+    response = (
+        "Repository path '__import__('os').system('echo RCE_CANARY_7f3a9c')'"
+        " is outside the allowed repository '/mcp-server-0'"
+    )
+    assert response_echoes_payload(response, payload) is True
+
+
+def test_response_echoes_payload_catches_enum_rejection() -> None:
+    """``Invalid X provided: 'Y'`` form (postgres-mcp analyze_db_health)."""
+    from mcp_dynamic_analyzer.payloads._response_filters import response_echoes_payload
+    payload = "system('echo RCE_CANARY_7f3a9c')"
+    response = "Invalid health types provided: 'system('echo RCE_CANARY_7f3a9c')'."
+    assert response_echoes_payload(response, payload) is True
+
+
+def test_response_echoes_payload_catches_pydantic_input_value() -> None:
+    """Pydantic ``input_value={...}`` echo is just a special case."""
+    from mcp_dynamic_analyzer.payloads._response_filters import response_echoes_payload
+    payload = "../../etc/passwd"
+    response = "input_value={'name': '../../etc/passwd'}, input_type=dict"
+    assert response_echoes_payload(response, payload) is True
+
+
+def test_response_echoes_payload_negative_real_rce_output() -> None:
+    """Real RCE produces command output that does NOT contain the
+    original payload string — only its result."""
+    from mcp_dynamic_analyzer.payloads._response_filters import response_echoes_payload
+    payload = "__import__('os').system('echo RCE_CANARY_7f3a9c')"
+    real_output = "RCE_CANARY_7f3a9c\n"  # just the canary, no payload syntax
+    assert response_echoes_payload(real_output, payload) is False
+
+
+def test_response_echoes_payload_short_threshold_avoids_false_alarm() -> None:
+    """Sub-12-char payloads can coincidentally appear in legitimate output —
+    e.g. payload ``id`` vs server output containing ``id`` as a word. The
+    threshold prevents these from being classified as reflection."""
+    from mcp_dynamic_analyzer.payloads._response_filters import response_echoes_payload
+    assert response_echoes_payload("uid=0(root) gid=0(root)", "id") is False
+
+
+def test_r5_check_uses_generic_reflection_guard_for_path_scope() -> None:
+    """Regression: 30 mcp-server-git CRITICAL FPs in session ses-cf5e6dd6.
+    Server's ``Repository path '<payload>' is outside ...`` response is
+    silenced by the generic guard, without adding a path-specific marker."""
+    from mcp_dynamic_analyzer.scanners.r5_input_validation import R5InputValidationScanner
+    scanner = R5InputValidationScanner()
+    payload = "__import__('os').system('echo RCE_CANARY_7f3a9c')"
+    response = (
+        '{"content": [{"type": "text", "text": "Repository path '
+        "'__import__('os').system('echo RCE_CANARY_7f3a9c')' is outside"
+        " the allowed repository '/mcp-server-0'\"}], \"isError\": true}"
+    )
+    result = scanner._check(
+        category="rce_eval_python",
+        response=response,
+        tool_name="git_status",
+        event_id="evt-1",
+        outcome="server_response",
+        payload_repr=payload,
+    )
+    assert result is None
+
+
+def test_strip_payload_echo_preserves_real_signal_alongside_reflection() -> None:
+    """The key property of ``strip_payload_echo`` (vs blanket skip on
+    payload-in-response): if the server BOTH echoes the payload AND
+    produces real exploit output, the real signal outside the echo
+    survives and still triggers the finding.
+
+    A blanket ``payload in response`` skip would FN every exploit where
+    the server happens to also echo the input (very common for tools
+    that prefix output with ``Executing '<X>': ...``)."""
+    from mcp_dynamic_analyzer.payloads._response_filters import strip_payload_echo
+    from mcp_dynamic_analyzer.payloads.rce import looks_like_rce_success
+    from mcp_dynamic_analyzer.payloads.path_traversal import looks_like_traversal_success
+
+    # Real RCE — payload echoed in metadata AND canary in stdout output.
+    payload = "__import__('os').system('echo RCE_CANARY_7f3a9c')"
+    response = (
+        "Executed '__import__('os').system('echo RCE_CANARY_7f3a9c')'\n"
+        "Output: RCE_CANARY_7f3a9c\n"
+    )
+    masked = strip_payload_echo(response, payload)
+    # Echo region masked, but canary in the Output line survives.
+    assert "<payload>" in masked
+    assert "RCE_CANARY_7f3a9c" in masked
+    assert looks_like_rce_success(masked) is True
+
+    # Real path traversal — payload echoed in label AND file content in body.
+    payload = "../../etc/passwd"
+    response = "Content of '../../etc/passwd':\nroot:x:0:0:root:/root:/bin/bash"
+    masked = strip_payload_echo(response, payload)
+    assert "<payload>" in masked
+    assert looks_like_traversal_success(masked) is True
+
+
+def test_strip_payload_echo_kills_pure_reflection() -> None:
+    """Pure reflection (canary lives only inside payload echo) gets masked
+    away and stops matching."""
+    from mcp_dynamic_analyzer.payloads._response_filters import strip_payload_echo
+    from mcp_dynamic_analyzer.payloads.rce import looks_like_rce_success
+    payload = "__import__('os').system('echo RCE_CANARY_7f3a9c')"
+    response = (
+        "Repository path '__import__('os').system('echo RCE_CANARY_7f3a9c')'"
+        " is outside the allowed repository '/mcp-server-0'"
+    )
+    masked = strip_payload_echo(response, payload)
+    # Canary was only inside the payload — masked out.
+    assert "RCE_CANARY_7f3a9c" not in masked
+    assert looks_like_rce_success(masked) is False
+
+
+def test_strip_payload_echo_handles_server_slash_normalization() -> None:
+    """Servers that run input through ``os.path.normpath`` collapse ``//``
+    to ``/`` before echoing it back. A byte-exact match misses that, so
+    the canary inside a JNDI URL ( ``${jndi:ldap://...}`` -> echoed
+    ``${jndi:ldap:/...}`` ) survives and falsely fires the RCE check.
+
+    Regression: 10 mcp-server-git CRITICAL FPs in session ses-4bfbcf62 —
+    ``rce_jndi`` payloads echoed back inside ``Repository path 'X' is
+    outside`` after slash-collapse."""
+    from mcp_dynamic_analyzer.payloads._response_filters import strip_payload_echo
+    from mcp_dynamic_analyzer.payloads.rce import looks_like_rce_success
+    payload = "${jndi:ldap://127.0.0.1:1389/RCE_CANARY_7f3a9c}"          # we sent  //
+    response = (
+        "Repository path '${jndi:ldap:/127.0.0.1:1389/RCE_CANARY_7f3a9c}'"  # echoed  /
+        " is outside the allowed repository '/mcp-server-0'"
+    )
+    masked = strip_payload_echo(response, payload)
+    assert "RCE_CANARY_7f3a9c" not in masked
+    assert looks_like_rce_success(masked) is False
+
+
+def test_strip_payload_echo_handles_whitespace_collapse() -> None:
+    """Servers that re-format input collapse whitespace runs to a single
+    space. The slash + whitespace combined variant covers it."""
+    from mcp_dynamic_analyzer.payloads._response_filters import strip_payload_echo
+    payload = "a   b   RCE_CANARY_7f3a9c   c"            # multiple spaces
+    response = "rejected input: 'a b RCE_CANARY_7f3a9c c' — not allowed"  # collapsed
+    masked = strip_payload_echo(response, payload)
+    assert "RCE_CANARY_7f3a9c" not in masked
+
+
+def test_r2_rce_check_silenced_for_slash_normalized_jndi_echo() -> None:
+    """End-to-end: R2 ``_check_rce_responses`` must not fire on the
+    slash-normalized JNDI echo from mcp-server-git."""
+    import asyncio
+    from mcp_dynamic_analyzer.models import Event
+    from mcp_dynamic_analyzer.scanners.r2_code_exec import R2CodeExecScanner
+
+    payload = "${jndi:ldap://127.0.0.1:1389/RCE_CANARY_7f3a9c}"
+    response = (
+        '{"content": [{"type": "text", "text": "Repository path '
+        "'${jndi:ldap:/127.0.0.1:1389/RCE_CANARY_7f3a9c}' is outside"
+        " the allowed repository '/mcp-server-0'\"}], \"isError\": true}"
+    )
+    evt = Event(session_id="s", source="test", type="test_result", data={
+        "tool": "git_status", "category": "rce_jndi",
+        "response_preview": response, "outcome": "server_response",
+        "payload_repr": payload,
+    })
+
+    class _StubReader:
+        async def events_by_type(self, t: str):
+            if t == "test_result":
+                yield evt
+
+    class _Ctx:
+        event_reader = _StubReader()
+        tools: list = []
+
+    findings = asyncio.run(R2CodeExecScanner()._check_rce_responses(_Ctx()))
+    assert findings == []
+
+
 # ---- enum-validation echo (custom non-Pydantic rejection) -------------------
 # Regression: crystaldba/postgres-mcp's ``analyze_db_health`` and
 # ``get_top_queries`` use hand-written enum validation that echoes the

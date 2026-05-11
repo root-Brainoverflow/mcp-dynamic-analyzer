@@ -83,8 +83,6 @@ _VALIDATION_REJECTION_MARKERS: tuple[str, ...] = (
     "valid options are",
     "must be one of",
     "please try again",
-    "invalid sort criteria",
-    "invalid health type",
 )
 
 
@@ -112,6 +110,95 @@ def strip_input_echoes(response_text: str) -> str:
     out = _MYSQL_NEAR_ECHO_RE.sub("near <redacted>", out)
     out = _ENUM_INVALID_ECHO_RE.sub("Invalid <redacted>", out)
     return out
+
+
+# Minimum length of a payload substring before we mask its echo in the
+# response. Below this threshold, common short tokens (``id``, ``ls``,
+# single chars) would coincidentally appear in legitimate output and we'd
+# wrongly strip them.
+_MIN_REFLECTION_LEN = 12
+
+_SLASH_RUN_RE = re.compile(r"/{2,}")
+_BACKSLASH_RUN_RE = re.compile(r"\\{2,}")
+_WS_RUN_RE = re.compile(r"\s{2,}")
+
+
+def _payload_echo_variants(payload_repr: str) -> list[str]:
+    """Plausible forms of *payload_repr* after common server normalisation.
+
+    Servers routinely transform input before echoing it back in an error:
+      * ``os.path.normpath`` / ``pathlib`` collapse ``//`` -> ``/``
+        (mcp-server-git: ``${jndi:ldap://...}`` echoed as ``${jndi:ldap:/...}``)
+      * Windows path joins collapse ``\\\\`` -> ``\\``
+      * Whitespace runs collapse to a single space
+
+    We replicate each transform on the payload (cheaper and more precise
+    than normalising the whole response, which would shift offsets and
+    break a clean ``.replace``). Only variants long enough to be
+    meaningful are returned.
+    """
+    variants: list[str] = []
+    seen: set[str] = set()
+
+    def _add(v: str) -> None:
+        if len(v) >= _MIN_REFLECTION_LEN and v not in seen:
+            seen.add(v)
+            variants.append(v)
+
+    _add(payload_repr)
+    _add(_SLASH_RUN_RE.sub("/", payload_repr))
+    _add(_BACKSLASH_RUN_RE.sub("\\\\", payload_repr))
+    _add(_WS_RUN_RE.sub(" ", payload_repr))
+    # Combined slash + whitespace collapse.
+    _add(_WS_RUN_RE.sub(" ", _SLASH_RUN_RE.sub("/", payload_repr)))
+    return variants
+
+
+def strip_payload_echo(response: str, payload_repr: str) -> str:
+    """Mask occurrences of *payload_repr* in *response* with ``<payload>``.
+
+    Server-agnostic reflection handling — replaces every hand-written
+    ``strip_*_echo`` regex (``Repository path 'X' is outside``,
+    ``Invalid X provided: 'Y'``, Pydantic ``input_value={...}``, ...).
+
+    Also masks common *normalised* forms of the payload (slash-collapse,
+    whitespace-collapse), because servers often run input through
+    ``os.path.normpath`` / similar before echoing — a byte-exact match
+    alone misses those (``${jndi:ldap://...}`` -> echoed ``${jndi:ldap:/...}``).
+
+    Unlike a blanket skip-on-echo, this preserves any indicator that
+    survives outside the echoed region. So a real exploitation that ALSO
+    echoes the payload (``Executed '<payload>': RCE_CANARY``) still fires
+    because the canary lives outside the masked region. Only the
+    "rejected and reflected" pattern (indicator ONLY inside the echo)
+    is silenced.
+
+    Short payloads (<12 chars) are left untouched so legitimate output
+    containing common tokens (``id``, ``ls``) isn't masked away.
+    """
+    if not payload_repr or not response:
+        return response
+    if len(payload_repr) < _MIN_REFLECTION_LEN:
+        return response
+    out = response
+    for variant in _payload_echo_variants(payload_repr):
+        out = out.replace(variant, "<payload>")
+    return out
+
+
+def response_echoes_payload(response: str, payload_repr: str) -> bool:
+    """Diagnostic: does *response* contain *payload_repr* verbatim?
+
+    Used as a *boolean* signal for legacy callers; prefer
+    ``strip_payload_echo`` + indicator matching for correctness. Kept
+    because backward-compat and explicit "this WAS a reflection event"
+    logging is occasionally useful.
+    """
+    if not payload_repr or not response:
+        return False
+    if len(payload_repr) < _MIN_REFLECTION_LEN:
+        return False
+    return payload_repr in response
 
 
 # Outcomes whose ``response_preview`` is text the server actually produced.
