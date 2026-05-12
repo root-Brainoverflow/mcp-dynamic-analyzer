@@ -19,7 +19,9 @@ Two complementary helpers:
 
 from __future__ import annotations
 
+import json
 import re
+from urllib.parse import quote, quote_plus
 
 # Pydantic v2 emits ``... input_value=<value>, input_type=<type> ...`` in its
 # validation errors. The value can span multi-line so use DOTALL and stop at
@@ -94,6 +96,81 @@ def is_validation_rejection(response_text: str) -> bool:
     return any(marker in lower for marker in _VALIDATION_REJECTION_MARKERS)
 
 
+def is_clean_success_envelope(response_text: str) -> bool:
+    """True iff *response_text* is a *successful* structured tool result.
+
+    A server that returns clean data is, by definition, not malfunctioning —
+    whatever error-looking strings the data happens to contain (GitHub issue
+    titles like ``"Cannot read properties of undefined"``, Stack Overflow
+    links, log excerpts, ...). This gate is used by the **server-malfunction**
+    indicators (unhandled-error / OOM / stack-overflow / parser-failure) so
+    they don't fire on legitimate returned content. It is **not** applied to
+    the exploitation-success indicators (RCE / injection / traversal), which
+    legitimately match on a successful response carrying command output.
+
+    Heuristic: the preview parses as a JSON object, carries no ``isError: true``
+    flag and no top-level ``error`` key. (``response_preview`` is the tool
+    *result* dict — typically ``{"content": [...], "isError": false}`` — not
+    the JSON-RPC envelope.)
+
+    The preview is truncated (~2 KB), so a large successful result won't parse.
+    Fallback: it starts with the MCP success-result wrapper ``{"content"`` and
+    the visible portion shows no ``"isError": true`` — true of a truncated data
+    response, false of a (short, fully-visible) error envelope.
+    """
+    if not response_text:
+        return False
+    s = response_text.lstrip()
+    try:
+        obj = json.loads(s)
+    except (json.JSONDecodeError, ValueError):
+        obj = None
+    if isinstance(obj, dict):
+        return obj.get("isError") is not True and "error" not in obj
+    # Truncated preview — couldn't parse. Treat as success only if it opens
+    # with the content wrapper, shows no error flag in what we can see, and the
+    # visible text carries no unmistakable error marker (``Traceback (most
+    # recent ...``, FastMCP's ``Error executing tool ...`` wrapper). This keeps
+    # us from suppressing a finding on a server that dumped a huge traceback
+    # whose ``isError:true`` got truncated off the end.
+    if not s.startswith('{"content"'):
+        return False
+    low = s.lower()
+    if '"iserror": true' in low or '"iserror":true' in low:
+        return False
+    if "traceback (most recent" in low or "error executing tool" in low:
+        return False
+    return True
+
+
+def is_handled_tool_error(response_text: str) -> bool:
+    """True iff the response is an error the server *caught and returned*.
+
+    FastMCP-style servers wrap a tool-handler exception as
+    ``{"content": [{"type": "text", "text": "Error executing tool <name>: <exc>"}], "isError": true}``.
+    When such a wrapper carries an OOM / stack-overflow / abort-looking
+    message, that message is a *handled* exception — the process is alive and
+    reporting an error, not a real process crash / unbounded OOM. R6 should
+    still surface it, but at a lower severity than an *unhandled* malfunction
+    (raw traceback, segfault, ...); R5's "unhandled error" check should skip it
+    entirely (there's nothing unhandled about a caught-and-returned exception).
+    """
+    if not response_text:
+        return False
+    low = response_text.lower()
+    # Strong, specific signal: the FastMCP wrapper phrase + an error envelope.
+    if "error executing tool" in low and ('"iserror": true' in low or '"iserror":true' in low):
+        return True
+    # General: parses as a dict the server explicitly flagged as an error. An
+    # ``isError: true`` response *is* the server choosing to report rather than
+    # crash — that's "handled" for our purposes.
+    try:
+        obj = json.loads(response_text)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return isinstance(obj, dict) and obj.get("isError") is True
+
+
 def strip_input_echoes(response_text: str) -> str:
     """Mask framework input-value echoes that reflect the original payload.
 
@@ -114,13 +191,53 @@ def strip_input_echoes(response_text: str) -> str:
 
 # Minimum length of a payload substring before we mask its echo in the
 # response. Below this threshold, common short tokens (``id``, ``ls``,
-# single chars) would coincidentally appear in legitimate output and we'd
-# wrongly strip them.
-_MIN_REFLECTION_LEN = 12
+# ``; id``, single chars) would coincidentally appear in legitimate output
+# and we'd wrongly strip them. Kept low enough that concrete short payloads
+# like ``/.dockerenv`` (11) or ``[$where]`` (8) are still masked when the
+# server merely echoes them back in a rejection message.
+_MIN_REFLECTION_LEN = 6
 
 _SLASH_RUN_RE = re.compile(r"/{2,}")
 _BACKSLASH_RUN_RE = re.compile(r"\\{2,}")
 _WS_RUN_RE = re.compile(r"\s{2,}")
+_ESCAPE_RE = re.compile(r"\\(.)")
+
+
+def _collapse_escapes(text: str, passes: int = 5) -> str:
+    """Strip backslash-escapes so ``\\'`` / ``\\\\'`` collapse back to ``'``.
+
+    Servers commonly ``repr()`` the offending input before putting it in an
+    exception message (``key <#assign cl=\\'freemarker...`` instead of
+    ``key <#assign cl='freemarker...``), and the captured ``response_preview``
+    may be JSON-encoded on top of that — doubling every backslash. Both layers
+    defeat a byte-exact ``payload_repr in response`` check. Collapsing ``\\X``
+    -> ``X`` repeatedly (idempotent once no escape remains) lets the echo line
+    up again. Used only as a fallback when the verbatim/normalised match fails.
+    """
+    for _ in range(passes):
+        collapsed = _ESCAPE_RE.sub(r"\1", text)
+        if collapsed == text:
+            break
+        text = collapsed
+    return text
+
+
+def _escape_variant(text: str) -> str | None:
+    """``repr()``-style escaped form of *text* (control chars / non-ASCII).
+
+    A server that puts the offending value in an exception message via
+    ``repr()`` / ``str(exc)`` turns real control characters into their
+    escape sequences — a real newline ``\\n`` becomes the two-char literal
+    ``\\n``. Our ``payload_repr`` keeps the *raw* characters, so the
+    byte-exact echo check misses it (newline != backslash-n). Mimicking the
+    escaping on the payload restores the match. ``unicode_escape`` is the
+    closest stdlib analogue of CPython's ``repr`` for this purpose.
+    """
+    try:
+        escaped = text.encode("unicode_escape").decode("ascii")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return None
+    return escaped if escaped != text else None
 
 
 def _payload_echo_variants(payload_repr: str) -> list[str]:
@@ -131,6 +248,13 @@ def _payload_echo_variants(payload_repr: str) -> list[str]:
         (mcp-server-git: ``${jndi:ldap://...}`` echoed as ``${jndi:ldap:/...}``)
       * Windows path joins collapse ``\\\\`` -> ``\\``
       * Whitespace runs collapse to a single space
+      * ``repr()`` / ``str(exc)`` escape control chars
+        (mcp-server-git: ``\\necho CANARY\\n`` echoed as ``\\necho CANARY\\n``
+        — a real newline rendered as the literal two-char ``\\n``)
+      * URL / percent encoding when the input lands in a request URL
+        (github-mcp-server: ``__import__('os').system('echo CANARY')`` echoed
+        as ``__import__%28%27os%27%29.system%28%27echo%20CANARY%27%29`` inside
+        a ``GET https://api.github.com/orgs/<payload>/...: 404`` error)
 
     We replicate each transform on the payload (cheaper and more precise
     than normalising the whole response, which would shift offsets and
@@ -140,8 +264,8 @@ def _payload_echo_variants(payload_repr: str) -> list[str]:
     variants: list[str] = []
     seen: set[str] = set()
 
-    def _add(v: str) -> None:
-        if len(v) >= _MIN_REFLECTION_LEN and v not in seen:
+    def _add(v: str | None) -> None:
+        if v and len(v) >= _MIN_REFLECTION_LEN and v not in seen:
             seen.add(v)
             variants.append(v)
 
@@ -151,6 +275,24 @@ def _payload_echo_variants(payload_repr: str) -> list[str]:
     _add(_WS_RUN_RE.sub(" ", payload_repr))
     # Combined slash + whitespace collapse.
     _add(_WS_RUN_RE.sub(" ", _SLASH_RUN_RE.sub("/", payload_repr)))
+    # ``repr()``-escaped form, and that form once more JSON-encoded (the
+    # preview is JSON, so an already-escaped echo gets its backslash doubled).
+    esc = _escape_variant(payload_repr)
+    _add(esc)
+    if esc is not None:
+        _add(esc.replace("\\", "\\\\"))
+    # URL/percent-encoded forms — for servers that drop the input into a
+    # request URL. ``safe=""`` encodes ``/`` too (path-component escaping);
+    # ``quote`` (default ``safe="/"``) and ``quote_plus`` cover the other
+    # common variants. ``quote`` UTF-8-encodes first, so a lone-surrogate
+    # payload raises ``UnicodeEncodeError`` — such a payload can't end up in a
+    # URL anyway, so just skip the URL variants for it.
+    try:
+        _add(quote(payload_repr, safe=""))
+        _add(quote(payload_repr))
+        _add(quote_plus(payload_repr))
+    except (TypeError, UnicodeError):
+        pass
     return variants
 
 
@@ -173,8 +315,13 @@ def strip_payload_echo(response: str, payload_repr: str) -> str:
     "rejected and reflected" pattern (indicator ONLY inside the echo)
     is silenced.
 
-    Short payloads (<12 chars) are left untouched so legitimate output
-    containing common tokens (``id``, ``ls``) isn't masked away.
+    Short payloads (<6 chars) are left untouched so legitimate output
+    containing common tokens (``id``, ``ls``, ``; id``) isn't masked away.
+
+    Final fallback: if neither the verbatim nor the normalised forms match,
+    collapse backslash-escapes on both sides (servers ``repr()`` the input;
+    the captured preview may also be JSON-encoded) and try once more — see
+    ``_collapse_escapes``.
     """
     if not payload_repr or not response:
         return response
@@ -183,7 +330,18 @@ def strip_payload_echo(response: str, payload_repr: str) -> str:
     out = response
     for variant in _payload_echo_variants(payload_repr):
         out = out.replace(variant, "<payload>")
-    return out
+    if out != response:
+        return out
+    # Nothing matched verbatim — try with backslash-escapes collapsed away.
+    collapsed_resp = _collapse_escapes(response)
+    collapsed_payload = _collapse_escapes(payload_repr)
+    if (
+        len(collapsed_payload) >= _MIN_REFLECTION_LEN
+        and collapsed_payload in collapsed_resp
+        and collapsed_resp != response
+    ):
+        return collapsed_resp.replace(collapsed_payload, "<payload>")
+    return response
 
 
 def response_echoes_payload(response: str, payload_repr: str) -> bool:

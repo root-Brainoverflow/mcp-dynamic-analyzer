@@ -580,3 +580,223 @@ def test_postgres_line_echo_strips_jvm_classpath_from_unhandled_check() -> None:
         "        ^"
     )
     assert not looks_like_unhandled_error(response)
+
+
+# ---- ses-c30b0ac1 mcp-server-time false positives --------------------------
+# Four CRITICAL FPs from a single mcp-server-time scan:
+#   * 2x R2 (rce_ssti / rce_eval_python) — server ``repr()``'d the rejected
+#     timezone key, turning ``'`` into ``\'`` and (after the preview was
+#     JSON-encoded) ``\\'``, defeating the byte-exact echo match so the
+#     ``freemarker.template`` / canary indicators survived.
+#   * 2x R5 (path_traversal ``/.dockerenv`` 11 chars, nosql ``[$where]``
+#     8 chars) — the payloads were echoed verbatim in a correct rejection
+#     message but were shorter than the old 12-char reflection threshold.
+
+
+def test_strip_payload_echo_handles_repr_escaped_ssti_echo() -> None:
+    """Server ``repr()``-escapes the rejected key (``'`` -> ``\\'``) and the
+    captured preview is JSON-encoded on top (``\\'`` -> ``\\\\'``). The
+    escape-collapse fallback must still recognise the echo so the SSTI
+    indicator inside it doesn't fire R2."""
+    from mcp_dynamic_analyzer.payloads._response_filters import strip_payload_echo
+    from mcp_dynamic_analyzer.payloads.rce import looks_like_rce_success
+
+    payload = (
+        "<#assign cl='freemarker.template.utility.JythonRuntime'?new()>"
+        "${cl(\"import os;os.system('id')\")}"
+    )
+    # As captured: server repr() -> \' , preview JSON-encoded -> \\'
+    response = (
+        '{"content": [{"type": "text", "text": "Error processing '
+        "mcp-server-time query: Invalid timezone: 'No time zone found with key "
+        "<#assign cl=\\\\'freemarker.template.utility.JythonRuntime\\\\'?new()>"
+        "${cl(\\\"import os;os.system(\\\\'id\\\\')\\\")}'\"}], \"isError\": true}"
+    )
+    masked = strip_payload_echo(response, payload)
+    assert "<payload>" in masked
+    assert "freemarker.template" not in masked
+    assert looks_like_rce_success(masked) is False
+
+
+def test_strip_payload_echo_handles_single_backslash_repr_echo() -> None:
+    """Even with only one layer of escaping (raw ``\\'`` from ``repr()``,
+    no JSON re-encoding) the fallback collapses it."""
+    from mcp_dynamic_analyzer.payloads._response_filters import strip_payload_echo
+
+    payload = "x='RCE_CANARY_7f3a9c'"
+    response = "No time zone found with key x=\\'RCE_CANARY_7f3a9c\\'"
+    masked = strip_payload_echo(response, payload)
+    assert "RCE_CANARY_7f3a9c" not in masked
+
+
+def test_strip_payload_echo_handles_control_char_repr_echo() -> None:
+    """Payload with a real newline; server ``repr()``s it into the literal
+    two-char ``\\n`` when echoing the rejected value back.
+
+    Regression: 5 mcp-server-git CRITICAL command-injection FPs in session
+    ses-f6b55fa9 — payload ``\\necho CMDINJECTION_CANARY\\n`` (real newlines)
+    sent as ``repo_path``, echoed as
+    ``Repository path '\\necho CMDINJECTION_CANARY\\n' is outside ...`` (the
+    newlines rendered as the 2-char escape). The byte-exact match missed it,
+    so the ``CMDINJECTION_CANARY`` indicator inside the echo fired."""
+    from mcp_dynamic_analyzer.payloads._response_filters import strip_payload_echo
+    from mcp_dynamic_analyzer.payloads.command_injection import looks_like_injection_success
+
+    payload = "\necho CMDINJECTION_CANARY\n"  # real newlines
+    response = (
+        '{"content": [{"type": "text", "text": "Repository path '
+        "'\\necho CMDINJECTION_CANARY\\n' is outside the allowed repository "
+        "'/mcp-server-0'\"}], \"isError\": true}"
+    )
+    masked = strip_payload_echo(response, payload)
+    assert "CMDINJECTION_CANARY" not in masked
+    assert looks_like_injection_success(masked) is False
+
+
+def test_strip_payload_echo_handles_control_char_repr_echo_json_doubled() -> None:
+    """Same as above but the captured preview JSON-encodes the already-escaped
+    echo, doubling the backslash (``\\n`` -> ``\\\\n``)."""
+    from mcp_dynamic_analyzer.payloads._response_filters import strip_payload_echo
+
+    payload = "\necho CMDINJECTION_CANARY\n"
+    response = "Repository path '\\\\necho CMDINJECTION_CANARY\\\\n' is outside the allowed repo"
+    masked = strip_payload_echo(response, payload)
+    assert "CMDINJECTION_CANARY" not in masked
+
+
+def test_strip_payload_echo_masks_short_concrete_payloads() -> None:
+    """``/.dockerenv`` (11) and ``[$where]`` (8) are concrete enough to mask
+    when echoed verbatim in a rejection — the 6-char floor still admits them
+    while keeping ``id``/``ls`` protected."""
+    from mcp_dynamic_analyzer.payloads._response_filters import strip_payload_echo
+    from mcp_dynamic_analyzer.payloads.path_traversal import looks_like_traversal_success
+
+    resp_path = "ZoneInfo keys may not be absolute paths, got: /.dockerenv"
+    masked_path = strip_payload_echo(resp_path, "/.dockerenv")
+    assert ".dockerenv" not in masked_path
+    assert looks_like_traversal_success(masked_path) is False
+
+    resp_nosql = "No time zone found with key [$where]"
+    masked_nosql = strip_payload_echo(resp_nosql, "[$where]")
+    assert "$where" not in masked_nosql
+
+
+def test_strip_payload_echo_still_ignores_tiny_payloads() -> None:
+    """Below the 6-char floor we don't touch the response, so a coincidental
+    ``id`` in legitimate output is never masked away."""
+    from mcp_dynamic_analyzer.payloads._response_filters import strip_payload_echo
+
+    assert strip_payload_echo("uid=0(root) gid=0(root)", "id") == "uid=0(root) gid=0(root)"
+    assert strip_payload_echo("anything", "; id") == "anything"
+
+
+def test_collapse_escapes_idempotent_on_clean_text() -> None:
+    from mcp_dynamic_analyzer.payloads._response_filters import _collapse_escapes
+
+    assert _collapse_escapes("plain text, no backslashes") == "plain text, no backslashes"
+    assert _collapse_escapes("a\\\\b\\\\c") == "abc"
+
+
+# ---- ses-99894360 github-mcp-server false positives ------------------------
+# 5 FPs on github-mcp-server (Go, GitHub API client — eval-s nothing):
+#   * 3x R2 RCE — payload landed in a request URL, URL-encoded, and echoed back
+#     inside a "GET https://api.github.com/orgs/<payload>/...: 404" error.
+#   * 1x R3 readonly mismatch — pull_request_read flagged because a stray
+#     "run" in its serialized schema matched the destructive-word regex.
+#   * 1x R5 unhandled-error — search_issues returned real GitHub issue data;
+#     one issue's title is "Cannot read properties of undefined (...)".
+
+
+def test_strip_payload_echo_handles_url_encoded_echo() -> None:
+    from mcp_dynamic_analyzer.payloads._response_filters import strip_payload_echo
+    from mcp_dynamic_analyzer.payloads.rce import looks_like_rce_success
+
+    payload = "__import__('os').system('echo RCE_CANARY_7f3a9c')"
+    response = (
+        '{"content": [{"type": "text", "text": "failed to list issue types: '
+        "GET https://api.github.com/orgs/__import__%28%27os%27%29.system%28%27echo%20RCE_CANARY_7f3a9c%27%29/issue-types: "
+        '404 Not Found []"}], "isError": true}'
+    )
+    masked = strip_payload_echo(response, payload)
+    assert "RCE_CANARY_7f3a9c" not in masked
+    assert looks_like_rce_success(masked) is False
+
+
+def test_strip_payload_echo_url_variant_does_not_crash_on_lone_surrogate() -> None:
+    from mcp_dynamic_analyzer.payloads._response_filters import strip_payload_echo
+    # urllib.parse.quote UTF-8-encodes first; a lone surrogate must be tolerated.
+    assert strip_payload_echo("No time zone found with key \ud800x\ud800", "\ud800") == "No time zone found with key \ud800x\ud800"
+
+
+def test_is_clean_success_envelope() -> None:
+    from mcp_dynamic_analyzer.payloads._response_filters import is_clean_success_envelope
+
+    assert is_clean_success_envelope('{"content": [{"type": "text", "text": "data"}], "isError": false}')
+    assert is_clean_success_envelope('{"total_count": 5, "items": []}')
+    assert not is_clean_success_envelope('{"content": [{"type": "text", "text": "oops"}], "isError": true}')
+    assert not is_clean_success_envelope('{"error": {"code": -32602}}')
+    assert not is_clean_success_envelope("McpError(-32602): bad params")  # not JSON
+    assert not is_clean_success_envelope("")
+    # truncated successful preview: opens with the content wrapper, no isError:true visible
+    truncated_ok = '{"content": [{"type": "text", "text": "{\\"items\\":[' + '{\\"x\\":1},' * 400
+    assert is_clean_success_envelope(truncated_ok)
+    # an error envelope whose flag is visible is not clean even if it's long
+    assert not is_clean_success_envelope('{"content": [{"type": "text", "text": "err"}], "isError": true' + " " * 2000)
+
+
+def test_unhandled_error_indicator_in_returned_data_not_flagged_when_clean_success() -> None:
+    """``search_issues`` returns real GitHub issue data; an issue title
+    "Cannot read properties of undefined ..." must not become an R5 finding."""
+    from mcp_dynamic_analyzer.payloads._response_filters import is_clean_success_envelope
+    from mcp_dynamic_analyzer.payloads.type_confusion import looks_like_unhandled_error
+
+    resp = (
+        '{"content": [{"type": "text", "text": "{\\"total_count\\":20520,\\"incomplete_results\\":false,'
+        '\\"items\\":[{\\"id\\":1,\\"title\\":\\"Cannot read properties of undefined (reading \'attributes\')\\"}]}"}],'
+        ' "isError": false}'
+    )
+    # the indicator does match the raw text...
+    assert looks_like_unhandled_error(resp) is True
+    # ...but the response is a clean successful data envelope, so the scanner gate suppresses it
+    assert is_clean_success_envelope(resp) is True
+
+
+# ---- handled tool-error detection (ses-e102838d / ses-61492eee) -------------
+# FastMCP wraps a tool-handler exception as
+#   {"content": [{"type": "text", "text": "Error executing tool X: <exc>"}], "isError": true}
+# An OOM / recursion / abort message in such a wrapper is a *handled* exception
+# (process alive), so R6 de-rates it to MEDIUM and R5's "unhandled error" check
+# skips it. Regression: 2 false HIGH "Stack overflow" on excel-mcp (and 7 on a
+# Spotify MCP) for a deeply-nested-JSON-string payload that hit a caught
+# RecursionError.
+
+
+def test_is_handled_tool_error() -> None:
+    from mcp_dynamic_analyzer.payloads._response_filters import is_handled_tool_error
+
+    assert is_handled_tool_error(
+        '{"content": [{"type": "text", "text": "Error executing tool format_range: '
+        'maximum recursion depth exceeded while decoding a JSON array from a unicode string"}], "isError": true}'
+    )
+    # general isError:true (no FastMCP wrapper phrase) still counts as handled
+    assert is_handled_tool_error('{"content": [{"type": "text", "text": "boom"}], "isError": true}')
+    # clean success / non-error envelopes are not handled errors
+    assert not is_handled_tool_error('{"content": [{"type": "text", "text": "data"}], "isError": false}')
+    assert not is_handled_tool_error('{"total_count": 5, "items": []}')
+    # a *raw*, un-enveloped traceback is NOT "handled" — that's the real malfunction
+    assert not is_handled_tool_error("Traceback (most recent call last):\n  File ...\nKeyError: 'x'")
+    assert not is_handled_tool_error("")
+
+
+def test_handled_recursion_in_fastmcp_wrapper_is_not_unhandled_error_for_r5() -> None:
+    from mcp_dynamic_analyzer.payloads._response_filters import is_handled_tool_error
+    from mcp_dynamic_analyzer.payloads.type_confusion import looks_like_unhandled_error
+
+    resp = (
+        '{"content": [{"type": "text", "text": "Error executing tool apply_formula: ValueError: bad input"}], '
+        '"isError": true}'
+    )
+    # the raw text might match the unhandled-error heuristic...
+    assert looks_like_unhandled_error(resp) is True
+    # ...but it's a handled (caught + returned) error, so R5 must skip it
+    assert is_handled_tool_error(resp) is True

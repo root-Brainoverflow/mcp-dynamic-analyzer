@@ -37,6 +37,8 @@ from mcp_dynamic_analyzer.payloads import (
     type_confusion,
 )
 from mcp_dynamic_analyzer.payloads._response_filters import (
+    is_clean_success_envelope,
+    is_handled_tool_error,
     is_server_outcome,
     is_validation_rejection,
     strip_payload_echo,
@@ -64,6 +66,13 @@ class FuzzingSequence(TestSequence):
 
     def __init__(self, session_id: str) -> None:
         self._session_id = session_id
+        # Payload *categories* the orchestrator has flagged as server-killing
+        # after a crash-and-restart. Skipped for *every* tool: a process-level
+        # crash takes down all tools, so once a category is shown to crash the
+        # server, re-sending its payloads to other tools only risks more
+        # crashes (each burning a restart budget) for zero new signal — the
+        # finding is already recorded for the first crash.
+        self.skip_categories: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -166,6 +175,8 @@ class FuzzingSequence(TestSequence):
             "object": "obj_params",
         }[param_kind]
         for category, payloads in groups:
+            if category in self.skip_categories:
+                continue
             if depth >= len(payloads):
                 continue
             if loop.time() >= deadline:
@@ -233,7 +244,12 @@ class FuzzingSequence(TestSequence):
                 )
                 resp_text = _safe_dump(result)
                 outcome = "server_response"
-            except ServerCrashError:
+            except ServerCrashError as exc:
+                # Tag the in-flight (tool, category) so the orchestrator can
+                # tell the restarted sequence to skip it instead of replaying
+                # the payload that just killed the server.
+                if not getattr(exc, "crash_signature", None):
+                    exc.crash_signature = (tool_name, category)  # type: ignore[attr-defined]
                 raise  # propagate immediately — do not record a fake test_result
             except asyncio.TimeoutError:
                 resp_text = f"CallTimeout: no response within {_CALL_TIMEOUT:.0f}s"
@@ -501,8 +517,19 @@ class R5InputValidationScanner(BaseScanner):
                     reproduction=f"Call tool '{tool_name}' with an RCE/SSTI payload",
                 )
 
-        # Type-confusion: all categories including new ones.
-        if type_confusion.looks_like_unhandled_error(masked):
+        # Type-confusion: all categories including new ones. Skip when:
+        #  * the response is a clean, successful structured result — a server
+        #    that returns data isn't malfunctioning, whatever error-looking
+        #    strings the returned content carries (``search_issues`` returning
+        #    a GitHub issue titled "Cannot read properties of undefined"); or
+        #  * the response is a *handled* tool error (FastMCP ``isError: true``
+        #    "Error executing tool X: <exc>") — a caught-and-returned exception
+        #    is, by definition, not an *unhandled* error.
+        if (
+            not is_clean_success_envelope(response)
+            and not is_handled_tool_error(response)
+            and type_confusion.looks_like_unhandled_error(masked)
+        ):
             return Finding(
                 risk_type=RiskType.R5,
                 severity=Severity.MEDIUM,

@@ -170,7 +170,29 @@ class StdioInterceptor:
         """Continuously read lines from stdout and dispatch."""
         try:
             while not self._closed:
-                line = await self._stdout.readline()
+                try:
+                    line = await self._stdout.readline()
+                except ValueError as exc:
+                    # ``StreamReader.readline`` raises ValueError (wrapping
+                    # ``LimitOverrunError``) when a single line exceeds the
+                    # configured buffer limit. This happens when a
+                    # well-behaved server echoes a huge fuzz payload back in
+                    # its error message — the server is *fine*, our read
+                    # buffer just couldn't hold the line. The buffer has been
+                    # cleared by readline(); log, drop the orphaned line, and
+                    # keep reading. The pending request for that line will be
+                    # resolved via the fuzzer's per-call timeout, NOT as a
+                    # server crash.
+                    log.warning(
+                        "interceptor.oversized_line",
+                        error=str(exc),
+                        hint=(
+                            "Server response line exceeded the read limit — "
+                            "likely echoing a large fuzz payload. Skipping it; "
+                            "this is not a server crash."
+                        ),
+                    )
+                    continue
                 if not line:
                     log.warning("interceptor.eof", hint="Server stdout closed — process likely crashed.")
                     self.server_died = True

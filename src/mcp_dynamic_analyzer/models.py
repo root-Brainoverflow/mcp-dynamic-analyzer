@@ -131,4 +131,15 @@ class AnalysisOutput(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ServerCrashError(Exception):
-    """Raised when the sequencer detects that the MCP server process has terminated."""
+    """Raised when the sequencer detects that the MCP server process has terminated.
+
+    Callers may attach two optional attributes:
+
+    * ``remaining_sequences`` — the ``TestSequence`` list (crashed one first)
+      the orchestrator should rerun on a fresh sandbox.
+    * ``crash_signature`` — the ``(tool_name, category)`` of the payload that
+      was in flight when the server died. The tool name is kept for the
+      ``server_crash`` event / finding; the orchestrator skips the whole
+      *category* on rerun (a process crash affects all tools, so re-firing
+      the category elsewhere only risks more crashes).
+    """

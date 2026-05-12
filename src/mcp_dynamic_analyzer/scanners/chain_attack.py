@@ -180,5 +180,16 @@ _DANGEROUS_WORD_RE = re.compile(
 
 
 def _looks_destructive(tool: ToolInfo) -> bool:
-    text = _tool_metadata_text(tool)
+    """True iff the tool's *salient* metadata (name + description) names a
+    destructive operation.
+
+    The serialized input schema is deliberately **not** searched: it routinely
+    mentions "run"/"write"/... benignly (e.g. a ``method`` param described as
+    "the operation to run"), which produced a false "Read-only annotation
+    mismatch" on github-mcp-server's ``pull_request_read``. Annotations are
+    likewise just hint flags + a human title. A genuinely destructive tool
+    says so in its name or description; if a server hides destructiveness *only*
+    in the schema, the readOnlyHint heuristic isn't the right detector for it.
+    """
+    text = tool.name.lower() + " " + (tool.description or "").lower()
     return _DANGEROUS_WORD_RE.search(text) is not None

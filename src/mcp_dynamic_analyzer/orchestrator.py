@@ -268,6 +268,13 @@ async def _collect(
 
         remaining = list(sequences)
         crash_count = 0
+        # Payload categories that have crashed the server in a prior
+        # iteration. Re-applied to every fuzzing sequence before each
+        # (re)run so a restarted sequence skips the whole category instead
+        # of replaying it tool-by-tool — a process crash takes down all
+        # tools, so re-firing the category elsewhere only burns more restart
+        # budget for no new signal.
+        crash_categories: set[str] = set()
         sysmon_enabled = (
             config.scanners.r1_data_access.enabled
             or config.scanners.r2_code_exec.enabled
@@ -284,6 +291,12 @@ async def _collect(
             # prepend InitSequence so the new server gets re-initialised.
             if not isinstance(remaining[0], InitSequence):
                 remaining = [InitSequence(session_id), *remaining]
+            # Propagate known crash-trigger categories to every fuzzing
+            # sequence so the restarted run skips them instead of replaying
+            # the same payload class tool-by-tool.
+            for seq in remaining:
+                if hasattr(seq, "skip_categories"):
+                    seq.skip_categories = set(crash_categories)
             monitors: list[Any] = []
             async with Sandbox(
                 config.server,
@@ -324,9 +337,13 @@ async def _collect(
                 except ServerCrashError as exc:
                     crash_count += 1
                     remaining = getattr(exc, "remaining_sequences", [])
+                    sig = getattr(exc, "crash_signature", None)
+                    if sig:
+                        crash_categories.add(sig[1])  # sig == (tool, category)
                     log.warning(
                         "orchestrator.server_crashed",
                         crash_count=crash_count,
+                        crash_signature=sig,
                         remaining_sequences=[s.name for s in remaining],
                         hint=(
                             "Server process crashed mid-scan. "

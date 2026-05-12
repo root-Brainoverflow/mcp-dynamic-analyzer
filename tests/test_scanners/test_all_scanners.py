@@ -246,6 +246,45 @@ class TestR6Stability:
         assert len(findings) == 1
         assert findings[0].severity == Severity.HIGH
 
+    async def test_handled_recursion_error_is_medium_not_high(self, event_store: EventStore) -> None:
+        """A RecursionError caught and returned by FastMCP (``isError: true``,
+        ``Error executing tool X: maximum recursion depth ...``) is a resilience
+        concern, not a process crash — report MEDIUM, not HIGH 'stack overflow'.
+        Regression: 2 false HIGH on excel-mcp / 7 on a Spotify MCP."""
+        from mcp_dynamic_analyzer.scanners.r6_stability import R6StabilityScanner
+        ctx = await _ctx_with_events(event_store, [
+            make_event(
+                "test", "test_result", sequence="fuzz_stability", tool="format_range",
+                category="json_bomb", outcome="server_response",
+                response_preview=(
+                    '{"content": [{"type": "text", "text": "Error executing tool format_range: '
+                    'maximum recursion depth exceeded while decoding a JSON array from a unicode string"}], "isError": true}'
+                ),
+                payload_repr="[[[[[...]]]]]",
+            ),
+        ])
+        findings = await R6StabilityScanner().analyze(ctx)
+        hits = [f for f in findings if "recursion" in f.title.lower()]
+        assert len(hits) == 1
+        assert hits[0].severity == Severity.MEDIUM
+        assert "handled" in hits[0].title.lower()
+
+    async def test_unhandled_stack_overflow_still_high(self, event_store: EventStore) -> None:
+        """A raw, un-enveloped stack-overflow message (no ``isError`` wrapper)
+        is a genuine malfunction — keep it HIGH."""
+        from mcp_dynamic_analyzer.scanners.r6_stability import R6StabilityScanner
+        ctx = await _ctx_with_events(event_store, [
+            make_event(
+                "test", "test_result", sequence="fuzz_stability", tool="x",
+                category="deep_nesting", outcome="server_response",
+                response_preview="Fatal: stack overflow detected in worker",
+                payload_repr="[[[]]]",
+            ),
+        ])
+        findings = await R6StabilityScanner().analyze(ctx)
+        hits = [f for f in findings if "stack overflow" in f.title.lower()]
+        assert len(hits) == 1 and hits[0].severity == Severity.HIGH
+
     async def test_timeout(self, event_store: EventStore) -> None:
         from mcp_dynamic_analyzer.scanners.r6_stability import R6StabilityScanner
         ctx = await _ctx_with_events(event_store, [
@@ -293,6 +332,98 @@ class TestR6Stability:
         assert len(results) == 1
         assert "ClientSerializationError" in results[0].data["response_preview"]
 
+    async def test_server_crash_tags_signature(self, event_store: EventStore) -> None:
+        """``_fuzz_one`` annotates the propagated ServerCrashError with the
+        in-flight (tool, category) so the orchestrator can skip it on rerun."""
+        from mcp_dynamic_analyzer.models import ServerCrashError
+        from mcp_dynamic_analyzer.scanners.r6_stability import StabilityFuzzingSequence
+
+        class CrashingClient:
+            async def call_tool(self, name: str, arguments: dict) -> dict:
+                raise ServerCrashError("server stream ended")
+
+        async with event_store.writer as writer:
+            seq = StabilityFuzzingSequence(session_id="ses-test")
+            with pytest.raises(ServerCrashError) as ei:
+                await seq._fuzz_one(
+                    CrashingClient(), writer, "create_entities", "memory_bomb",
+                    {"entities": ["x"] * 10},
+                )
+        assert getattr(ei.value, "crash_signature", None) == ("create_entities", "memory_bomb")
+
+    async def test_skip_category_skips_known_crasher_for_all_tools(
+        self, event_store: EventStore,
+    ) -> None:
+        """A category in ``skip_categories`` is never sent — to any tool —
+        on rerun, while other categories still run."""
+        from mcp_dynamic_analyzer.scanners.r6_stability import StabilityFuzzingSequence
+
+        class FakeClient:
+            async def list_tools(self) -> list[ToolInfo]:
+                return [
+                    ToolInfo(name="a", input_schema={"properties": {"x": {"type": "string"}}}),
+                    ToolInfo(name="b", input_schema={"properties": {"y": {"type": "string"}}}),
+                ]
+
+            async def call_tool(self, name: str, arguments: dict) -> dict:
+                return {"ok": True}
+
+        async with event_store.writer as writer:
+            seq = StabilityFuzzingSequence(session_id="ses-test")
+            seq.skip_categories = {"memory_bomb"}
+            await seq.execute(FakeClient(), writer)
+
+        cats_by_tool: dict[str, set[str]] = {}
+        async for evt in event_store.reader.events_by_type("test_input"):
+            cats_by_tool.setdefault(evt.data.get("tool"), set()).add(evt.data.get("category"))
+        assert cats_by_tool, "fuzzing ran"
+        for tool, cats in cats_by_tool.items():
+            assert "memory_bomb" not in cats, f"{tool} should skip memory_bomb"
+            assert cats  # other stability categories still ran for this tool
+
+    async def test_crash_finding_is_specific_when_signature_present(
+        self, event_store: EventStore,
+    ) -> None:
+        """server_crash events carrying (tool, category) yield a specific
+        finding, and repeated identical crash events collapse to one."""
+        from mcp_dynamic_analyzer.scanners.r6_stability import R6StabilityScanner
+        ctx = await _ctx_with_events(event_store, [
+            make_event("test", "server_crash", sequence="fuzz_stability",
+                       tool="create_entities", category="memory_bomb"),
+            make_event("test", "server_crash", sequence="fuzz_stability",
+                       tool="create_entities", category="memory_bomb"),
+        ])
+        findings = await R6StabilityScanner().analyze(ctx)
+        crash_findings = [f for f in findings if "crash" in f.title.lower()]
+        assert len(crash_findings) == 1
+        f = crash_findings[0]
+        assert "create_entities" in f.title and "memory_bomb" in f.title
+        assert f.tool_name == "create_entities"
+
+    async def test_same_category_crash_on_many_tools_collapses_to_one_finding(
+        self, event_store: EventStore,
+    ) -> None:
+        """A transport-layer crash that reproduces on several tools (one
+        server_crash event each, from successive restarts) is reported as a
+        single finding listing all affected tools — not N findings."""
+        from mcp_dynamic_analyzer.scanners.r6_stability import R6StabilityScanner
+        ctx = await _ctx_with_events(event_store, [
+            make_event("test", "server_crash", sequence="fuzz_input_validation",
+                       tool="git_diff_unstaged", category="encoding_traps"),
+            make_event("test", "server_crash", sequence="fuzz_input_validation",
+                       tool="git_diff_staged", category="encoding_traps"),
+            make_event("test", "server_crash", sequence="fuzz_input_validation",
+                       tool="git_diff", category="encoding_traps"),
+        ])
+        findings = await R6StabilityScanner().analyze(ctx)
+        crash_findings = [f for f in findings if "crash" in f.title.lower()]
+        assert len(crash_findings) == 1
+        f = crash_findings[0]
+        assert "encoding_traps" in f.title
+        for t in ("git_diff_unstaged", "git_diff_staged", "git_diff"):
+            assert t in f.description
+        assert len(f.related_events) == 3
+
 
 # ---------------------------------------------------------------------------
 # Chain Attack
@@ -311,6 +442,37 @@ class TestChainAttack:
         ctx = await _ctx_with_events(event_store, [], tools)
         findings = await ChainAttackScanner().analyze(ctx)
         assert any("read-only annotation mismatch" in f.title.lower() for f in findings)
+
+    async def test_read_named_tool_not_flagged_despite_dangerous_word_in_schema(
+        self, event_store: EventStore,
+    ) -> None:
+        """A tool whose name affirms read-only (``..._read``) must not be flagged
+        just because a benign "run"/"write"/... appears in its serialized schema.
+        Regression: false 'Read-only annotation mismatch' on github-mcp-server's
+        ``pull_request_read`` (its ``method`` param description mentioned "run")."""
+        from mcp_dynamic_analyzer.scanners.chain_attack import ChainAttackScanner
+        tools = [
+            ToolInfo(
+                name="pull_request_read",
+                description="Get information on a specific pull request in GitHub repository.",
+                annotations={"readOnlyHint": True, "title": "Get details for a single pull request"},
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "method": {
+                            "type": "string",
+                            "enum": ["get", "get_diff", "get_status", "get_files"],
+                            "description": "the read operation to run",
+                        },
+                        "owner": {"type": "string"},
+                        "repo": {"type": "string"},
+                    },
+                },
+            ),
+        ]
+        ctx = await _ctx_with_events(event_store, [], tools)
+        findings = await ChainAttackScanner().analyze(ctx)
+        assert not any("read-only annotation mismatch" in f.title.lower() for f in findings)
 
     async def test_server_guided_chain_from_description(self, event_store: EventStore) -> None:
         from mcp_dynamic_analyzer.scanners.chain_attack import ChainAttackScanner

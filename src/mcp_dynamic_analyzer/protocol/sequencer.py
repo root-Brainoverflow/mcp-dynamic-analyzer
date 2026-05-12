@@ -72,9 +72,13 @@ class Sequencer:
             log.warning("sequencer.timeout", sequence=seq.name)
             await self._record("sequence_timeout", {"sequence": seq.name})
 
-        except ServerCrashError:
-            log.error("sequencer.crash", sequence=seq.name)
-            await self._record("server_crash", {"sequence": seq.name})
+        except ServerCrashError as exc:
+            sig = getattr(exc, "crash_signature", None)
+            data: dict[str, Any] = {"sequence": seq.name}
+            if sig:
+                data["tool"], data["category"] = sig
+            log.error("sequencer.crash", sequence=seq.name, crash_signature=sig)
+            await self._record("server_crash", data)
             raise
 
         except Exception as exc:

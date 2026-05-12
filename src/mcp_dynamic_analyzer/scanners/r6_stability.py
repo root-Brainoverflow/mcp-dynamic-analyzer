@@ -30,6 +30,8 @@ from mcp_dynamic_analyzer.models import (
     ToolInfo,
 )
 from mcp_dynamic_analyzer.payloads._response_filters import (
+    is_clean_success_envelope,
+    is_handled_tool_error,
     is_server_outcome,
     strip_payload_echo,
 )
@@ -75,6 +77,12 @@ class StabilityFuzzingSequence(TestSequence):
 
     def __init__(self, session_id: str) -> None:
         self._session_id = session_id
+        # Payload *categories* the orchestrator flagged as crash triggers
+        # after a previous run died and the sandbox was restarted. Skipped
+        # for every tool (a process crash takes down all tools, so re-sending
+        # the same category elsewhere only buys more crashes), so the rerun
+        # makes progress instead of exhausting restart budget on one bug.
+        self.skip_categories: set[str] = set()
 
     @property
     def name(self) -> str:
@@ -98,6 +106,8 @@ class StabilityFuzzingSequence(TestSequence):
 
             timeout_counts: dict[str, int] = {}
             for category, payload in payloads:
+                if category in self.skip_categories:
+                    continue
                 if timeout_counts.get(category, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
                     continue
                 for param in params:
@@ -149,7 +159,12 @@ class StabilityFuzzingSequence(TestSequence):
                 )
                 resp_text = _safe_dump(result)
                 outcome = "server_response"
-            except ServerCrashError:
+            except ServerCrashError as exc:
+                # Tag the in-flight (tool, category) so the orchestrator can
+                # tell the restarted sequence to skip it rather than replay
+                # the payload that just crashed the server.
+                if not getattr(exc, "crash_signature", None):
+                    exc.crash_signature = (tool_name, category)  # type: ignore[attr-defined]
                 raise  # propagate immediately — do not record a fake test_result
             except asyncio.TimeoutError:
                 resp_text = f"CallTimeout: no response within {_CALL_TIMEOUT:.0f}s"
@@ -210,21 +225,72 @@ class R6StabilityScanner(BaseScanner):
         return findings
 
     async def _check_crashes(self, reader: Any) -> list[Finding]:
-        findings: list[Finding] = []
+        # Group server_crash events by (sequence, category). A process-level
+        # crash from a malformed-input class (e.g. lone-surrogate
+        # ``encoding_traps``) reproduces on every tool that takes the
+        # offending argument and triggers one server_crash per restart — all
+        # of those describe a single vulnerability, usually in the shared
+        # transport/SDK layer rather than one tool. Events with no category
+        # recorded (legacy / non-fuzz crashes) each stand on their own.
+        groups: dict[tuple[str, str], dict[str, Any]] = {}
+        order: list[tuple[str, str]] = []
         async for evt in reader.events_by_type("server_crash"):
             seq = evt.data.get("sequence", "unknown")
+            tool = evt.data.get("tool")
+            cat = evt.data.get("category")
+            key = (seq, cat) if cat else (seq, f"\x00{evt.event_id}")
+            g = groups.get(key)
+            if g is None:
+                g = {"seq": seq, "cat": cat, "tools": [], "event_ids": []}
+                groups[key] = g
+                order.append(key)
+            g["event_ids"].append(evt.event_id)
+            if tool and tool not in g["tools"]:
+                g["tools"].append(tool)
+
+        findings: list[Finding] = []
+        for key in order:
+            g = groups[key]
+            seq, cat, tools, event_ids = g["seq"], g["cat"], g["tools"], g["event_ids"]
+            if cat and tools:
+                tool_list = ", ".join(f"'{t}'" for t in tools)
+                multi = len(tools) > 1
+                title = (
+                    f"Server crash on '{cat}' input — affects tools {tool_list}"
+                    if multi else
+                    f"Server crash triggered by '{cat}' payload to tool {tool_list}"
+                )
+                description = (
+                    f"Sending a '{cat}'-class payload to {tool_list} terminated the "
+                    f"MCP server process (sequence '{seq}'). A single malformed request "
+                    f"crashes the server — a trivially exploitable DoS."
+                )
+                if multi:
+                    description += (
+                        " The crash reproduces across every listed tool, so the fault "
+                        "is in the shared request/transport handling rather than one "
+                        "tool's logic."
+                    )
+                reproduction = f"Send a '{cat}' payload to tool '{tools[0]}'"
+                tool_name: str | None = tools[0]
+            else:
+                title = f"Server crashed during sequence '{seq}'"
+                description = (
+                    f"The MCP server process terminated unexpectedly while running "
+                    f"test sequence '{seq}'. This indicates fragile error handling "
+                    f"that could be exploited for DoS."
+                )
+                reproduction = f"Run sequence '{seq}' and observe server process"
+                tool_name = None
             findings.append(Finding(
                 risk_type=RiskType.R6,
                 severity=Severity.HIGH,
                 confidence=0.9,
-                title=f"Server crashed during sequence '{seq}'",
-                description=(
-                    f"The MCP server process terminated unexpectedly while "
-                    f"running test sequence '{seq}'. This indicates fragile "
-                    f"error handling that could be exploited for DoS."
-                ),
-                related_events=[evt.event_id],
-                reproduction=f"Run sequence '{seq}' and observe server process",
+                title=title,
+                description=description,
+                related_events=event_ids,
+                tool_name=tool_name,
+                reproduction=reproduction,
             ))
         return findings
 
@@ -317,13 +383,39 @@ class R6StabilityScanner(BaseScanner):
             payload_repr = evt.data.get("payload_repr", "")
             masked = strip_payload_echo(resp, payload_repr)
 
+            # A clean, *successful* structured result is not a malfunction —
+            # whatever error-looking strings the returned data happens to
+            # contain (e.g. ``search_issues`` returning a GitHub issue titled
+            # "Cannot read properties of undefined ..."). The malfunction
+            # indicators below only make sense on error/non-data responses.
+            if is_clean_success_envelope(resp):
+                continue
+
+            # A *handled* tool error (FastMCP ``{"isError": true, "...": "Error
+            # executing tool X: <exc>"}``) means the server caught the failure
+            # and returned it — the process is alive. An OOM / recursion /
+            # abort message in such a wrapper is a resilience concern but NOT a
+            # real process crash, so we de-rate it to MEDIUM rather than
+            # HIGH/CRITICAL.
+            handled = is_handled_tool_error(resp)
+
             if looks_like_oom(masked):
                 findings.append(Finding(
                     risk_type=RiskType.R6,
-                    severity=Severity.HIGH,
-                    confidence=0.85,
-                    title=f"OOM indicator on category '{cat}' for tool '{tool}'",
-                    description=f"Stability payload in category '{cat}' triggered an out-of-memory condition.",
+                    severity=Severity.MEDIUM if handled else Severity.HIGH,
+                    confidence=0.7 if handled else 0.85,
+                    title=(
+                        f"Handled out-of-memory error on category '{cat}' for tool '{tool}'"
+                        if handled else
+                        f"OOM indicator on category '{cat}' for tool '{tool}'"
+                    ),
+                    description=(
+                        f"Pathological input in category '{cat}' drove the server into an "
+                        f"out-of-memory condition; it was caught and returned as a tool "
+                        f"error (the process survives), but the resource exhaustion is real."
+                        if handled else
+                        f"Stability payload in category '{cat}' triggered an out-of-memory condition."
+                    ),
                     related_events=[evt.event_id],
                     tool_name=tool,
                     reproduction=f"Send '{cat}' payload to tool '{tool}'",
@@ -331,10 +423,20 @@ class R6StabilityScanner(BaseScanner):
             elif looks_like_stack_overflow(masked):
                 findings.append(Finding(
                     risk_type=RiskType.R6,
-                    severity=Severity.HIGH,
-                    confidence=0.85,
-                    title=f"Stack overflow on category '{cat}' for tool '{tool}'",
-                    description=f"Deeply-nested input in category '{cat}' caused a stack overflow.",
+                    severity=Severity.MEDIUM if handled else Severity.HIGH,
+                    confidence=0.7 if handled else 0.85,
+                    title=(
+                        f"Handled recursion-depth error on category '{cat}' for tool '{tool}'"
+                        if handled else
+                        f"Stack overflow on category '{cat}' for tool '{tool}'"
+                    ),
+                    description=(
+                        f"Deeply-nested input in category '{cat}' drove the server into a "
+                        f"recursion-depth error; it was caught and returned as a tool error "
+                        f"(the process survives), so the call fails rather than the server."
+                        if handled else
+                        f"Deeply-nested input in category '{cat}' caused a stack overflow."
+                    ),
                     related_events=[evt.event_id],
                     tool_name=tool,
                     reproduction=f"Send deeply-nested '{cat}' payload to tool '{tool}'",
@@ -353,10 +455,20 @@ class R6StabilityScanner(BaseScanner):
             elif looks_like_crash(masked):
                 findings.append(Finding(
                     risk_type=RiskType.R6,
-                    severity=Severity.CRITICAL,
-                    confidence=0.9,
-                    title=f"Process crash on category '{cat}' for tool '{tool}'",
-                    description=f"Payload in category '{cat}' caused the server process to crash (segfault / abort).",
+                    severity=Severity.MEDIUM if handled else Severity.CRITICAL,
+                    confidence=0.7 if handled else 0.9,
+                    title=(
+                        f"Handled crash-like error on category '{cat}' for tool '{tool}'"
+                        if handled else
+                        f"Process crash on category '{cat}' for tool '{tool}'"
+                    ),
+                    description=(
+                        f"The response for category '{cat}' carries a crash-like message "
+                        f"(segfault / abort) but came back as a handled tool error — likely a "
+                        f"crashed helper subprocess rather than the MCP server itself."
+                        if handled else
+                        f"Payload in category '{cat}' caused the server process to crash (segfault / abort)."
+                    ),
                     related_events=[evt.event_id],
                     tool_name=tool,
                     reproduction=f"Send '{cat}' payload to tool '{tool}'",

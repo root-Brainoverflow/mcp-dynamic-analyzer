@@ -192,6 +192,84 @@ def test_python_playwright_dependency_emits_python_hook() -> None:
     assert "python3 -m playwright install --with-deps chromium" in dockerfile
 
 
+def test_generic_local_python_deps_get_pip_installed(tmp_path) -> None:
+    """A plain local Python MCP server (no matching recipe) still gets its
+    declared deps installed into the sandbox image — otherwise it runs with
+    the container's interpreter and fails with ModuleNotFoundError."""
+    project = tmp_path / "my-mcp-server"
+    project.mkdir()
+    (project / "requirements.txt").write_text("spotipy>=2.0\nhttpx\n", encoding="utf-8")
+    script = project / "server.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+
+    server = ServerConfig(command=str(project / ".venv" / "bin" / "python"), args=[str(script)])
+    runtime = ResolvedRuntime(image="mcp-sandbox-python312", command="python3", reason="local python")
+
+    evidence = asyncio.run(SourcePreflightInspector().inspect(server, runtime, network_mode="none"))
+    assert evidence is not None and evidence.source == "local-manifest"
+    assert "spotipy" in evidence.python_dependencies and "httpx" in evidence.python_dependencies
+
+    plan = plan_bootstrap(server, runtime, evidence=evidence)
+    assert plan is not None
+    assert plan.has_image_changes
+    dockerfile = render_bootstrap_dockerfile(runtime.image, plan)
+    assert "python3 -m pip install --no-cache-dir httpx spotipy || true" in dockerfile
+
+
+def test_generic_local_node_deps_get_npm_installed_with_node_path() -> None:
+    server = ServerConfig(command="node", args=["/srv/app/index.js"])
+    runtime = ResolvedRuntime(image="mcp-sandbox-node22", command="node", reason="local node")
+    evidence = PreflightEvidence(
+        source="local-manifest",
+        manifest_path="/srv/app/package.json",
+        package_name="some-mcp",
+        node_dependencies=(("@some/sdk", "^1.0.0"), ("zod", "^3.0.0")),
+    )
+    plan = plan_bootstrap(server, runtime, evidence=evidence)
+    assert plan is not None
+    dockerfile = render_bootstrap_dockerfile(runtime.image, plan)
+    assert "RUN npm install -g @some/sdk zod || true" in dockerfile
+    assert "ENV NODE_PATH=/usr/local/lib/node_modules" in dockerfile
+    assert merged_bootstrap_env(plan)["NODE_PATH"] == "/usr/local/lib/node_modules"
+
+
+def test_remote_package_evidence_does_not_trigger_generic_install() -> None:
+    """For npx/uvx packages, the runner downloads its own deps — we must NOT
+    bake a generic pip/npm install for non-local-manifest evidence."""
+    server = ServerConfig(command="uvx", args=["some-python-mcp"])
+    runtime = ResolvedRuntime(image="mcp-sandbox-python312", command="uvx", reason="uvx")
+    evidence = PreflightEvidence(
+        source="pypi-api:some-python-mcp",
+        manifest_path="pypi metadata",
+        package_name="some-python-mcp",
+        python_dependencies=("requests", "pydantic"),
+    )
+    plan = plan_bootstrap(server, runtime, evidence=evidence)
+    # No recipe matches and the evidence isn't local-manifest -> no plan.
+    assert plan is None
+
+
+def test_local_manifest_project_root_added_to_pythonpath(tmp_path) -> None:
+    project = tmp_path / "my-mcp-server"
+    project.mkdir()
+    (project / "requirements.txt").write_text("spotipy\n", encoding="utf-8")
+    script = project / "server.py"
+    script.write_text("print('ok')\n", encoding="utf-8")
+
+    server = ServerConfig(command="python3", args=[str(script)])
+    sandbox = Sandbox(server, SandboxConfig())
+    runtime = sandbox._resolve_runtime()
+    evidence = asyncio.run(SourcePreflightInspector().inspect(server, runtime, network_mode="none"))
+    assert evidence is not None and evidence.source == "local-manifest"
+    sandbox._preflight_evidence = evidence  # normally set by _prepare_bootstrap_image
+
+    cmd = sandbox._build_docker_cmd()
+    # the script's project root is bind-mounted as /mcp-server-0 and added to PYTHONPATH
+    assert any(v.startswith("/mcp-server-0") for v in cmd)
+    pp = [cmd[i + 1] for i, a in enumerate(cmd) if a == "-e" and cmd[i + 1].startswith("PYTHONPATH=")]
+    assert pp and pp[0].endswith("/mcp-server-0")
+
+
 def test_sandbox_uses_bootstrap_image_and_env() -> None:
     server = ServerConfig(command="npx", args=["@playwright/mcp@latest"])
     sandbox = Sandbox(server, SandboxConfig(), honeypot_dir="/tmp/hp")

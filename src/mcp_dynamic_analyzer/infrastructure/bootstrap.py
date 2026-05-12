@@ -21,6 +21,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import tomllib
 import urllib.request
 from dataclasses import dataclass
@@ -291,6 +292,56 @@ class SourcePreflightInspector:
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+def _local_install_action(evidence: PreflightEvidence | None) -> BootstrapAction | None:
+    """Install a *local* server's declared dependencies into the sandbox image.
+
+    A local server (``command`` is a path, e.g. ``.../my-server/.venv/bin/python
+    server.py``) is launched inside the container with the *container's*
+    interpreter — a host venv is meaningless there — so the deps it declares in
+    its own ``requirements.txt`` / ``pyproject.toml`` / ``package.json`` must be
+    installed into the image, or its tool bodies fail with ``ModuleNotFoundError``
+    and R1/R2 coverage is effectively void. This is the generic counterpart to
+    the per-server recipes in ``builtin.yaml``: it fires for *any* server whose
+    preflight evidence came from a local manifest, not just the named ones.
+
+    Failures are tolerated (``|| true``) — one bad spec (a git/local-path
+    requirement, a conflicting pin) shouldn't sink the whole image build; the
+    rest still installs, and an unmet dep simply surfaces as the server's own
+    import error, which is the truthful signal anyway.
+    """
+    if evidence is None or evidence.source != "local-manifest":
+        return None
+
+    lines: list[str] = []
+    env: list[tuple[str, str]] = []
+
+    if evidence.python_dependencies:
+        specs = " ".join(shlex.quote(d) for d in evidence.python_dependencies)
+        lines.append(f"RUN python3 -m pip install --no-cache-dir {specs} || true")
+
+    if evidence.node_dependencies:
+        # npm version ranges in package.json (``^1.2``, git URLs, ``workspace:*``,
+        # …) don't all translate to clean install specs; install by bare name
+        # (latest), which is plenty for a security scan, and expose the global
+        # module dir so a flat ``node server.js`` can ``require()`` them.
+        names = " ".join(shlex.quote(name) for name, _ in evidence.node_dependencies)
+        lines.append(f"RUN npm install -g {names} || true")
+        env.append(("NODE_PATH", "/usr/local/lib/node_modules"))
+
+    if not lines:
+        return None
+
+    digest = hashlib.sha256(
+        repr((evidence.python_dependencies, evidence.node_dependencies)).encode(),
+    ).hexdigest()[:12]
+    return BootstrapAction(
+        action_id=f"local-deps-{digest}",
+        description="install local server dependencies declared in its manifest",
+        dockerfile_lines=tuple(lines),
+        env=tuple(env),
+    )
+
+
 def plan_bootstrap(
     server: ServerConfig,
     runtime: ResolvedRuntime,
@@ -301,10 +352,8 @@ def plan_bootstrap(
     """Infer prerequisite bootstrap actions for a server/runtime pair."""
     ctx = _build_match_context(server, runtime, evidence, stderr_snippet)
     matched = _REGISTRY.match(ctx)
-    if not matched:
-        return None
 
-    actions = tuple(
+    actions: list[BootstrapAction] = [
         BootstrapAction(
             action_id=a.action_id,
             description=a.description,
@@ -314,11 +363,19 @@ def plan_bootstrap(
             arg_rewrites=a.arg_rewrites,
         )
         for a in matched
-    )
-    return BootstrapPlan(
-        actions=actions,
-        reason=", ".join(a.description for a in matched),
-    )
+    ]
+    # Generic local-server dependency install — runs after any matched recipe
+    # (recipes may lay down system prerequisites the deps build against).
+    local_action = _local_install_action(evidence)
+    if local_action is not None:
+        actions.append(local_action)
+
+    if not actions:
+        return None
+    reasons = [a.description for a in matched]
+    if local_action is not None:
+        reasons.append(local_action.description)
+    return BootstrapPlan(actions=tuple(actions), reason=", ".join(reasons))
 
 
 def render_bootstrap_dockerfile(base_image: str, plan: BootstrapPlan) -> str:

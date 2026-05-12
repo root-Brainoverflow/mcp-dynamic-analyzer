@@ -370,12 +370,20 @@ class Sandbox:
         """Spawn a new subprocess and reset stderr collection buffer."""
         self._stderr_lines = []
         log.info("sandbox.start", cmd=" ".join(cmd))
+        # StreamReader line limit. Must comfortably exceed our largest fuzz
+        # payload (the 10 MB ``memory_bomb`` string) because well-behaved
+        # servers often echo the offending input back in their error message
+        # ("Invalid timezone: [Errno 36] File name too long: '...AAAA...'"),
+        # making a single response line ~10 MB. 8 MB was too small and
+        # produced a ``LimitOverrunError`` we used to misreport as a server
+        # crash. 32 MB gives ~3x headroom; ``_read_loop`` still degrades
+        # gracefully if even that is exceeded.
         self._proc = await asyncio.create_subprocess_exec(
             *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            limit=2 ** 23,
+            limit=2 ** 25,
         )
         log.info("sandbox.spawned", pid=self._proc.pid, use_docker=self._use_docker)
         self._stderr_task = asyncio.create_task(
@@ -730,6 +738,18 @@ class Sandbox:
             cmd += ["--network", "bridge"]
 
         merged_env = self._merged_env()
+        # A local-manifest server's project root is mounted via the absolute-path
+        # arg remap above (as ``/mcp-server-0``); append it to PYTHONPATH so the
+        # container interpreter can import the server's *own* package. Its
+        # declared third-party deps are installed into the bootstrap image
+        # (see ``bootstrap._local_install_action``).
+        ev = self._preflight_evidence
+        if ev is not None and getattr(ev, "source", None) == "local-manifest" and extra_mounts:
+            project_mount = next(iter(extra_mounts.values()))
+            existing_pp = merged_env.get("PYTHONPATH", "")
+            merged_env["PYTHONPATH"] = (
+                f"{existing_pp}:{project_mount}" if existing_pp else project_mount
+            )
         for key in merged_env:
             if _SECRET_KEY_RE.search(key):
                 log.warning(
