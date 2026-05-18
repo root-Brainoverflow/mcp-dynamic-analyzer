@@ -258,7 +258,18 @@ def generate_rce_payloads() -> list[tuple[str, str]]:
 
 RCE_INDICATORS: list[str] = [
     CANARY,
-    MATH_CANARY,
+    # MATH_CANARY (``9359``) intentionally NOT listed as a positive
+    # indicator. It is sent as a *probe* — ``{{1337*7}}`` distinguishes
+    # template-eval engines from literal-echo engines — but matching the
+    # bare number ``9359`` in a response cannot reliably prove eval:
+    #   * a 4-digit number coincides with legitimate output (timestamps,
+    #     IDs, port numbers, prices),
+    #   * a calculator-style MCP (``mcp-server-calculator``) returns ``9359``
+    #     for ``1337*7`` *by design* — that is the tool's purpose, not RCE.
+    # ses-959cbb9f: calculator MCP got a CRITICAL R2 RCE on a correct math
+    # answer. Real eval is caught via the unique ``CANARY`` string (sent
+    # as ``{{'RCE_CANARY_...'}}`` etc.) which cannot collide with legitimate
+    # tool output.
     "uid=",
     "gid=",
     "groups=",
@@ -297,3 +308,24 @@ def looks_like_rce_success(response_text: str) -> bool:
         if ind in cleaned:
             return True
     return False
+
+
+def looks_like_rce_success_strict(response_text: str) -> bool:
+    """Canary-only RCE check for retrieval / search tools.
+
+    Search and corpus-retrieval tools (Wikipedia, arXiv, YouTube transcript,
+    RSS, ...) return external content that *legitimately* contains generic
+    RCE indicators — Wikipedia articles describe ``uid=``, the XXE article
+    quotes ``file:///etc/passwd``, the PHP article contains ``PHP Version``.
+    Running the full indicator list against retrieval-tool responses
+    produces 100 %% false positives (ses-50a348b0 surfaced 3 CRITICAL FPs
+    on ``wikipedia-mcp`` exactly this way).
+
+    The only indicator that survives the corpus-content problem is the
+    unique canary we ourselves embed in our payloads — no corpus on the
+    internet indexes ``RCE_CANARY_7f3a9c`` because we randomised it once.
+    If the response contains the canary, the server's evaluator must
+    have actually rendered the payload — that's real eval / RCE.
+    """
+    from mcp_dynamic_analyzer.payloads._response_filters import strip_input_echoes
+    return CANARY in strip_input_echoes(response_text)

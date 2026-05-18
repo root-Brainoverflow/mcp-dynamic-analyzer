@@ -237,11 +237,18 @@ PAYLOADS: list[str] = (
 # ---------------------------------------------------------------------------
 
 ERROR_INDICATORS: list[str] = [
-    # Generic
+    # Generic — kept narrow enough that Python / JS / JSON parser errors
+    # don't masquerade as SQL leaks. Bare ``syntax error`` and bare
+    # ``unterminated string`` were dropped because Python's ``SyntaxError``
+    # uses both phrases (``unterminated string literal``, ``SyntaxError:
+    # ...``), producing CRITICAL SQL FPs on any tool that runs ``ast.parse``
+    # / ``eval`` on string input. ses-959cbb9f: ``mcp-server-calculator``
+    # got a CRITICAL R5 SQL leak finding on a payload of ``'`` because
+    # Python's tokenizer said ``unterminated string literal``.
     "sql syntax",
-    "syntax error",
+    "sql syntax error",
     "unclosed quotation",
-    "unterminated string",
+    "unterminated quoted string",  # PostgreSQL-specific phrasing
     "database error",
     "query failed",
     "sqlstate",

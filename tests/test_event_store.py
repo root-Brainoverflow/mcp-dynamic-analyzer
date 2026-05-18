@@ -76,3 +76,44 @@ class TestEventReader:
             await w.write(make_event(variation_tag="env_0"))
         env0 = [e async for e in event_store.reader.events_by_variation("env_0")]
         assert len(env0) == 2
+
+
+class TestWriteRobustness:
+    """The writer is fed arbitrary tool responses captured from fuzzed
+    targets. A self-referencing JSON structure must not tear down the
+    interceptor's read loop — we'd rather lose the offending event's
+    payload than the rest of the scan."""
+
+    async def test_write_survives_circular_reference_in_data(
+        self, event_store: EventStore,
+    ) -> None:
+        """ses with @antv/mcp-server-chart regression: a fuzz response
+        contained a self-referencing object → pydantic ``model_dump`` raised
+        ``ValueError: Circular reference detected (depth exceeded)`` → the
+        interceptor died → ``log.exception`` then ran rich's pretty-printer
+        on the same cyclic object → ``RecursionError`` cascade. After the
+        fix, the writer falls back to a sanitized envelope and the read
+        loop continues."""
+        cyclic: dict = {"name": "evil"}
+        cyclic["self"] = cyclic  # python-side cycle
+        evt = make_event("protocol", "mcp_response", direction="s2c", payload=cyclic)
+        async with event_store.writer as w:
+            await w.write(evt)  # must NOT raise
+        events = [e async for e in event_store.reader.events_by_type("mcp_response")]
+        assert len(events) == 1
+        data = events[0].data
+        assert "_serialization_failed" in data
+        assert data["_serialization_failed"] in {"ValueError", "RecursionError", "TypeError"}
+
+    async def test_normal_event_still_serialises_cleanly(
+        self, event_store: EventStore,
+    ) -> None:
+        """The defensive fallback must not affect normal events."""
+        evt = make_event("protocol", "mcp_response", direction="s2c",
+                         method=None, id=42, message={"result": {"ok": True}})
+        async with event_store.writer as w:
+            await w.write(evt)
+        events = [e async for e in event_store.reader.events_by_type("mcp_response")]
+        assert len(events) == 1
+        assert "_serialization_failed" not in events[0].data
+        assert events[0].data["id"] == 42

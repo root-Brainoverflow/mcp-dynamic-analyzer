@@ -51,7 +51,37 @@ class EventWriter:
         # ``model_dump_json()`` fails on lone-surrogate fuzz payloads because it
         # emits UTF-8 directly. Dump through stdlib json with ensure_ascii=True
         # so invalid Unicode code points stay escaped in the JSONL file.
-        line = json.dumps(event.model_dump(mode="json"), ensure_ascii=True) + "\n"
+        #
+        # Defensive: ``event.data`` carries arbitrary payloads we received from
+        # the server. A self-referencing JSON object (a fuzz target that wraps
+        # its own response, a ``$ref:"#"`` schema chain, etc.) makes
+        # ``model_dump`` recurse until pydantic raises ``ValueError: Circular
+        # reference detected``. Same shape but with a Python-side cycle in
+        # ``data`` (an MCP server returning a structure that pydantic
+        # accepted but json can't encode) throws ``RecursionError`` or
+        # ``TypeError`` inside ``json.dumps``. In all three cases we'd rather
+        # lose the offending event's payload than tear down the interceptor's
+        # read loop. Fall back to a minimal envelope marking the failure.
+        try:
+            dumped = event.model_dump(mode="json")
+            line = json.dumps(dumped, ensure_ascii=True, default=str) + "\n"
+        except (ValueError, RecursionError, TypeError) as exc:
+            sanitized = {
+                "event_id": event.event_id,
+                "session_id": event.session_id,
+                "ts": event.ts.isoformat() if hasattr(event.ts, "isoformat") else str(event.ts),
+                "source": event.source,
+                "type": event.type,
+                "direction": event.direction,
+                "variation_tag": event.variation_tag,
+                "data": {
+                    "_serialization_failed": type(exc).__name__,
+                    "_error": str(exc)[:200],
+                    "_hint": "Original event data was unserialisable (likely a "
+                             "circular reference in a fuzzed tool response).",
+                },
+            }
+            line = json.dumps(sanitized, ensure_ascii=True, default=str) + "\n"
         # Serialize writes: prevents interleaved bytes when concurrent coroutines
         # (interceptor, sequencer, monitors) write large and small events at the
         # same time through aiofiles' thread-pool executor.

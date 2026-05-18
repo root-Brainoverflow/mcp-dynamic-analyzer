@@ -23,7 +23,14 @@ from mcp_dynamic_analyzer.payloads._response_filters import (
     is_validation_rejection,
     strip_payload_echo,
 )
-from mcp_dynamic_analyzer.payloads.rce import looks_like_rce_success
+from mcp_dynamic_analyzer.payloads.rce import (
+    looks_like_rce_success,
+    looks_like_rce_success_strict,
+)
+from mcp_dynamic_analyzer.scanners._tool_classification import (
+    is_retrieval_tool,
+    lookup_tool,
+)
 from mcp_dynamic_analyzer.scanners.base import BaseScanner
 
 _SHELLS = {"sh", "bash", "zsh", "dash", "csh", "fish", "cmd", "cmd.exe", "powershell", "pwsh"}
@@ -104,6 +111,16 @@ class R2CodeExecScanner(BaseScanner):
         """Check fuzz test_result events for RCE-indicator strings in responses."""
         findings: list[Finding] = []
         reader = ctx.event_reader  # type: ignore[union-attr]
+        # Server name is used by retrieval-tool classification (a tool literally
+        # named ``search`` on ``wikipedia-mcp`` should be classified differently
+        # from one on ``mcp-server-git``). ``static_context`` carries the
+        # discovered ``serverInfo.name``; fall back to empty string when absent.
+        # ``getattr`` keeps lightweight test stubs (no ``static_context``
+        # attribute) working alongside the real ``AnalysisContext``.
+        server_name = ""
+        static = getattr(ctx, "static_context", None)
+        if static:
+            server_name = str(static.get("server_name", "") or "")
 
         async for evt in reader.events_by_type("test_result"):
             resp = evt.data.get("response_preview", "")
@@ -123,22 +140,38 @@ class R2CodeExecScanner(BaseScanner):
             # which survives the mask and still fires the check.
             payload_repr = evt.data.get("payload_repr", "")
             masked = strip_payload_echo(resp, payload_repr)
-            if looks_like_rce_success(masked):
-                tool = evt.data.get("tool", "unknown")
+
+            # Retrieval tools (search / wiki / fetch / docs / RAG / ...) return
+            # external corpus content that legitimately reproduces every generic
+            # RCE indicator. ses-50a348b0: wikipedia-mcp's ``search`` returned
+            # articles about ``passwd`` (Unix command, mentions ``uid=``), PHP
+            # (mentions ``PHP Version``), XXE (mentions ``file:///etc/passwd``)
+            # → 3 CRITICAL FPs. For those tools, only the unique canary counts
+            # as evidence: ``RCE_CANARY_7f3a9c`` isn't indexed by any corpus, so
+            # appearing in the response means the payload was actually evaluated.
+            tool_name = evt.data.get("tool", "unknown")
+            tool_info = lookup_tool(ctx.tools, tool_name)
+            strict = is_retrieval_tool(tool_info, server_name)
+            matched = (
+                looks_like_rce_success_strict(masked)
+                if strict
+                else looks_like_rce_success(masked)
+            )
+            if matched:
                 cat = evt.data.get("category", "")
                 findings.append(Finding(
                     risk_type=RiskType.R2,
                     severity=Severity.CRITICAL,
                     confidence=0.85,
-                    title=f"RCE indicator in response for tool '{tool}' (category '{cat}')",
+                    title=f"RCE indicator in response for tool '{tool_name}' (category '{cat}')",
                     description=(
-                        f"Tool '{tool}' returned content matching RCE success indicators "
+                        f"Tool '{tool_name}' returned content matching RCE success indicators "
                         f"after being sent a '{cat}' payload. "
                         f"Response excerpt: {resp[:300]}"
                     ),
                     related_events=[evt.event_id],
-                    tool_name=tool,
-                    reproduction=f"Send '{cat}' payload to tool '{tool}' and inspect response",
+                    tool_name=tool_name,
+                    reproduction=f"Send '{cat}' payload to tool '{tool_name}' and inspect response",
                 ))
 
         return findings

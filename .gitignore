@@ -33,9 +33,11 @@ htmlcov/
 # IDE
 .idea/
 .vscode/
+.claude/
 
 # Scan results (runtime output)
 results/
+poc/
 
 # Temp artifacts from fuzzing payloads leaking to CWD
 ..*/

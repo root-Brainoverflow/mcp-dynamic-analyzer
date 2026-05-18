@@ -45,6 +45,10 @@ from mcp_dynamic_analyzer.payloads._response_filters import (
 )
 from mcp_dynamic_analyzer.models import ServerCrashError
 from mcp_dynamic_analyzer.protocol.client import McpClient, McpError
+from mcp_dynamic_analyzer.scanners._tool_classification import (
+    is_retrieval_tool,
+    lookup_tool,
+)
 from mcp_dynamic_analyzer.scanners.base import BaseScanner, TestSequence
 
 log = structlog.get_logger()
@@ -380,6 +384,17 @@ class R5InputValidationScanner(BaseScanner):
             if evt.data.get("sequence") == "fuzz_input_validation":
                 results.append(evt)
 
+        # Pre-compute the set of retrieval-tool names so the per-event loop
+        # avoids re-doing the lookup for each result. Server name is fetched
+        # once from static_context (the analysis-phase view of serverInfo).
+        server_name = ""
+        if ctx.static_context:
+            server_name = str(ctx.static_context.get("server_name", "") or "")
+        retrieval_tools: set[str] = set()
+        for t in (ctx.tools or []):
+            if is_retrieval_tool(t, server_name):
+                retrieval_tools.add(t.name)
+
         for evt in results:
             cat = evt.data.get("category", "")
             resp = evt.data.get("response_preview", "")
@@ -387,7 +402,10 @@ class R5InputValidationScanner(BaseScanner):
             outcome = evt.data.get("outcome")  # None for legacy events
             payload_repr = evt.data.get("payload_repr", "")  # "" for legacy events
 
-            finding = self._check(cat, resp, tool, evt.event_id, outcome, payload_repr)
+            finding = self._check(
+                cat, resp, tool, evt.event_id, outcome, payload_repr,
+                is_retrieval=tool in retrieval_tools,
+            )
             if finding:
                 findings.append(finding)
 
@@ -401,6 +419,7 @@ class R5InputValidationScanner(BaseScanner):
         event_id: str,
         outcome: str | None = None,
         payload_repr: str = "",
+        is_retrieval: bool = False,
     ) -> Finding | None:
 
         # Indicator matching is only meaningful on text the server actually
@@ -429,6 +448,23 @@ class R5InputValidationScanner(BaseScanner):
         # *handled* error (structured response, not stack trace).
         rejected = is_validation_rejection(response)
 
+        # Retrieval / search tools (``wikipedia-mcp``, ``arxiv-mcp-server``,
+        # ``fetch``, ``rss``, ``youtube-transcript`` ...) return external
+        # corpus content. That corpus legitimately reproduces every generic
+        # exploit indicator — Wikipedia's XXE article quotes
+        # ``file:///etc/passwd``, the passwd article describes the
+        # ``root:x:0:0`` format, PHP docs contain ``uid=``. ses-50a348b0:
+        # wikipedia-mcp emitted 3 CRITICAL FPs (RCE + path-traversal) on
+        # exactly this pattern. Content-keyword checks have no canary
+        # mechanism, so they're skipped on retrieval tools. The NoSQL-leak
+        # branch (structural over-broad query data) and type-confusion
+        # unhandled-error branch (response shape, not content) remain
+        # because their signals don't trip on corpus text. R2 keeps running
+        # its RCE check on these tools in *strict* (canary-only) mode —
+        # see ``r2_code_exec._check_rce_responses``.
+        if is_retrieval and category in ("path_traversal", "command_injection", "sql_injection"):
+            return None
+
         if not rejected and category == "path_traversal" and path_traversal.looks_like_traversal_success(masked):
             return Finding(
                 risk_type=RiskType.R5,
@@ -453,7 +489,20 @@ class R5InputValidationScanner(BaseScanner):
                 reproduction=f"Call tool '{tool_name}' with a command-injection payload",
             )
 
-        if category == "sql_injection" and sql_injection.looks_like_sql_error(masked):
+        # SQL "error leak" is by definition error-shaped output. A successful
+        # tool response whose data happens to contain SQL keywords (template
+        # search returning a workflow titled "PostgreSQL Sandbox", a doc tool
+        # whose result text describes ``syntax error at or near``, etc.) is
+        # not a leak — it's just data. ses-121a3dbc regression: n8n-mcp's
+        # ``search_templates`` returned a workflow list including a template
+        # named "Generate & Test SQL Code with ... PostgreSQL Sandbox" → the
+        # plain ``postgresql`` substring fired FP. Gate on clean envelope to
+        # require the response to actually be (or look like) an error.
+        if (
+            category == "sql_injection"
+            and not is_clean_success_envelope(response)
+            and sql_injection.looks_like_sql_error(masked)
+        ):
             return Finding(
                 risk_type=RiskType.R5,
                 severity=Severity.HIGH,
@@ -478,7 +527,20 @@ class R5InputValidationScanner(BaseScanner):
             )
 
         if not rejected and (category.startswith("nosql_") or category == "nosql_sql_like"):
-            if nosql_injection.looks_like_nosql_error(masked):
+            # Same gate as SQL above. NoSQL "error" indicators include some
+            # very generic strings (``syntax error``, ``compile error``,
+            # ``loading``, ``did you mean``, ``field "``) that legitimate
+            # template / documentation / search-result content reproduces
+            # constantly — without the clean-envelope gate, n8n-mcp's
+            # ``search_templates`` would emit a NoSQL-error FP for almost
+            # any non-trivial response. For *retrieval* tools the same
+            # generic strings appear all over the corpus too, with no
+            # canary discriminator — skip the error branch entirely.
+            if (
+                not is_retrieval
+                and not is_clean_success_envelope(response)
+                and nosql_injection.looks_like_nosql_error(masked)
+            ):
                 return Finding(
                     risk_type=RiskType.R5,
                     severity=Severity.HIGH,
@@ -489,6 +551,10 @@ class R5InputValidationScanner(BaseScanner):
                     tool_name=tool_name,
                     reproduction=f"Call tool '{tool_name}' with a NoSQL operator payload",
                 )
+            # ``looks_like_nosql_leak`` is an *exploitation-success* indicator
+            # (the response contains over-broad query data — admin role flags,
+            # bulk document dumps). Those legitimately appear in clean success
+            # envelopes, so the clean-envelope gate does NOT apply here.
             if nosql_injection.looks_like_nosql_leak(masked):
                 return Finding(
                     risk_type=RiskType.R5,
@@ -501,21 +567,12 @@ class R5InputValidationScanner(BaseScanner):
                     reproduction=f"Call tool '{tool_name}' with a NoSQL injection payload",
                 )
 
-        if not rejected and (category.startswith("rce_") or category in (
-            "ssti", "eval_python", "eval_js", "eval_ruby", "eval_php", "eval_perl",
-            "expr_lang", "jndi", "deserialize", "yaml_load", "xxe",
-        )):
-            if rce.looks_like_rce_success(masked):
-                return Finding(
-                    risk_type=RiskType.R2,
-                    severity=Severity.CRITICAL,
-                    confidence=0.9,
-                    title=f"RCE indicator in response for tool '{tool_name}'",
-                    description="RCE/SSTI/eval payload produced code-execution output.",
-                    related_events=[event_id],
-                    tool_name=tool_name,
-                    reproduction=f"Call tool '{tool_name}' with an RCE/SSTI payload",
-                )
+        # RCE / SSTI / eval / JNDI / deserialise / YAML-load / XXE detection
+        # is owned by ``R2CodeExecScanner._check_rce_responses`` — running the
+        # same indicator check here too produced duplicate findings (one R2,
+        # one R5 with no category label, both pointing at the same events) in
+        # ses-45ee8108. ``R2`` is the correct risk axis for code-execution
+        # outcomes; ``R5`` keeps the remaining input-handling checks below.
 
         # Type-confusion: all categories including new ones. Skip when:
         #  * the response is a clean, successful structured result — a server

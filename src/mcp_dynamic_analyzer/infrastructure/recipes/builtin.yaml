@@ -76,6 +76,70 @@ recipes:
     env:
       PLAYWRIGHT_BROWSERS_PATH: /ms-playwright
 
+  # ──────────────────────── System Google Chrome (Node.js / CDP) ──────────────
+  #
+  # Servers built on the Chrome DevTools Protocol via puppeteer-core /
+  # chrome-launcher (chrome-devtools-mcp, etc.) do NOT bundle a browser — they
+  # expect a *system* Google Chrome at ``/opt/google/chrome/chrome`` (channel
+  # "stable"). ``playwright install --with-deps chrome`` installs Google Chrome
+  # Stable to exactly that path (plus its apt deps).
+  #
+  # No server *name* is hardcoded here: the recipe fires either eagerly at
+  # preflight when one of those CDP libraries shows up in the resolved
+  # dependencies, or reactively when a tool response / stderr says it couldn't
+  # find Chrome (the orchestrator feeds that text back to the bootstrap step).
+
+  # Install Chrome where puppeteer-core / chrome-devtools-mcp look for it:
+  # /opt/google/chrome/chrome. On amd64 we use Google's apt repo to install
+  # the real branded "channel stable" build — that's the path google-chrome-
+  # stable lays down natively, and what puppeteer's default channel detection
+  # expects. On arm64 (e.g. Apple Silicon hosts running the sandbox image
+  # without --platform=linux/amd64), Google doesn't publish Chrome, so we
+  # fall back to Debian's chromium package and symlink it into the same
+  # path — the existence check passes and CDP still works because the
+  # binary speaks the same protocol. `|| true` on the install lines keeps
+  # the image build resilient on offline / partial-network rebuilds; the
+  # caveat-finding path handles the "still no Chrome" outcome cleanly.
+  - id: system-chrome
+    description: "System Google Chrome for puppeteer-core / CDP servers (amd64: google-chrome-stable, arm64 fallback: chromium symlink)"
+    match:
+      runtime_prefix: "mcp-sandbox-node"
+      any_of:
+        - node_deps_any:
+            - puppeteer-core
+            - chrome-launcher
+            - chrome-remote-interface
+        - stderr_tokens_any:
+            - "could not find google chrome executable"
+            - "could not find chrome"
+            - /opt/google/chrome/chrome
+    dockerfile_lines:
+      - "USER root"
+      - |-
+        RUN set -eu \
+            && mkdir -p /opt/google/chrome \
+            && apt-get update \
+            && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+            && if [ "$(dpkg --print-architecture)" = "amd64" ]; then \
+                   curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+                        | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+                && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+                        > /etc/apt/sources.list.d/google-chrome.list \
+                && apt-get update \
+                && (apt-get install -y --no-install-recommends google-chrome-stable || true); \
+               fi \
+            && if [ ! -x /opt/google/chrome/chrome ]; then \
+                   (apt-get install -y --no-install-recommends chromium || true) \
+                && if [ -x /usr/bin/chromium ]; then ln -sf /usr/bin/chromium /opt/google/chrome/chrome; fi; \
+               fi \
+            && rm -rf /var/lib/apt/lists/*
+      - "ENV CHROME_PATH=/opt/google/chrome/chrome"
+      - "ENV PUPPETEER_EXECUTABLE_PATH=/opt/google/chrome/chrome"
+      - "USER user"
+    env:
+      CHROME_PATH: /opt/google/chrome/chrome
+      PUPPETEER_EXECUTABLE_PATH: /opt/google/chrome/chrome
+
   # ───────────────────────────── Playwright / Python ───────────────────────────
 
   - id: playwright-python-chrome

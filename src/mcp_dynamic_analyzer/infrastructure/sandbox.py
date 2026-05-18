@@ -32,6 +32,7 @@ import structlog
 
 from mcp_dynamic_analyzer.config import SandboxConfig, ServerConfig
 from mcp_dynamic_analyzer.infrastructure.bootstrap import (
+    BootstrapAction,
     BootstrapPlan,
     PreflightEvidence,
     SourcePreflightInspector,
@@ -187,8 +188,29 @@ _LIB_TO_APT: dict[str, str] = {
 }
 
 
+# A bare ``X: command not found`` (or ``spawn X ENOENT``) for a command that
+# isn't in the curated map: on Debian the package name *usually* equals the
+# command name (``pandoc``, ``jq``, ``geckodriver`` does not exist but the
+# install is best-effort so a miss is harmless). Interpreters / package runners
+# never want this treatment.
+_RE_CMD_NF_BARE = re.compile(r"(?:^|[\s:'\"])([a-z][a-z0-9.+\-]{1,40}):\s+command not found", re.IGNORECASE | re.M)
+_RE_SPAWN_ENOENT = re.compile(r"\bspawn\s+([a-z][a-z0-9.+\-]{1,40})\s+ENOENT\b", re.IGNORECASE)
+_NOT_A_PACKAGE = frozenset({
+    "node", "python", "python3", "npm", "npx", "uv", "uvx", "pip", "pip3",
+    "sh", "bash", "deno", "bun", "bunx", "ruby", "perl", "java", "go", "cargo",
+})
+
+
 def _apt_packages_from_stderr(stderr: str) -> list[str]:
-    """Heuristically map stderr failure patterns to apt package names."""
+    """Heuristically map stderr / error-output patterns to apt package names.
+
+    Three layers: (1) curated command→package map, (2) ``libY.so.N``→``libYN``,
+    (3) best-effort — a bare ``X: command not found`` for an unknown ``X`` ⇒
+    candidate package ``X`` (the install is run best-effort, so a wrong guess
+    just no-ops). Combined with recipe ``stderr_tokens_any`` matching, this
+    covers most "the tool shells out to a binary that isn't installed" cases
+    without anyone editing a recipe file.
+    """
     seen: dict[str, None] = {}  # ordered set via dict
 
     for m in _RE_CMD_NOT_FOUND.finditer(stderr):
@@ -209,6 +231,16 @@ def _apt_packages_from_stderr(stderr: str) -> list[str]:
                     pkg = f"{so_m.group(1)}{so_m.group(2)}"
             if pkg:
                 seen[pkg] = None
+
+    # Layer 3: best-effort guess (package name == command name).
+    for rx in (_RE_CMD_NF_BARE, _RE_SPAWN_ENOENT):
+        for m in rx.finditer(stderr):
+            cmd = m.group(1).strip("'\"").lower()
+            if cmd in _COMMAND_TO_APT.values() or cmd in seen or cmd in _NOT_A_PACKAGE:
+                continue
+            if cmd in _COMMAND_TO_APT:  # already curated above under its mapped pkg
+                continue
+            seen[cmd] = None
 
     return list(seen.keys())
 
@@ -247,6 +279,7 @@ class Sandbox:
         sysmon_enabled: bool = False,
         runtime_resolver: RuntimeResolver | None = None,
         preflight_inspector: SourcePreflightInspector | None = None,
+        prereq_hint: str | None = None,
     ) -> None:
         self._server = server_config
         self._sandbox = sandbox_config
@@ -254,6 +287,11 @@ class Sandbox:
         self._honeypot_dir = honeypot_dir
         self._use_docker = use_docker
         self._sysmon_enabled = sysmon_enabled
+        # Error text (from a prior run's tool responses or stderr) that names a
+        # missing runtime prerequisite. When set, the bootstrap-image step
+        # re-resolves it via recipe ``stderr_tokens_any`` and the apt heuristic
+        # so the rebuilt image has the fix baked in *before* the server runs.
+        self._prereq_hint = prereq_hint
         self._resolver = runtime_resolver or RuntimeResolver()
         self._preflight = (
             preflight_inspector or SourcePreflightInspector()
@@ -426,6 +464,31 @@ class Sandbox:
 
     # -- bootstrap retry -----------------------------------------------------
 
+    def _apt_bootstrap_action(self, hint: str) -> BootstrapAction | None:
+        """Synthesise an ``apt-get install`` step for binaries / libs the error
+        text says are missing (``X: command not found``, missing ``.so``).
+
+        Each package is installed independently and best-effort (``|| true``) so
+        a wrong best-effort guess doesn't sink the layer or the other packages.
+        """
+        pkgs = _apt_packages_from_stderr(hint)
+        if not pkgs:
+            return None
+        pkgs_sorted = sorted(pkgs)
+        pkgs_str = " ".join(pkgs_sorted)
+        installs = " ; ".join(
+            f"( apt-get install -y --no-install-recommends {p} || true )" for p in pkgs_sorted
+        )
+        return BootstrapAction(
+            action_id="apt:" + hashlib.sha256(pkgs_str.encode()).hexdigest()[:10],
+            description=f"apt install {pkgs_str} (from runtime error, best-effort)",
+            dockerfile_lines=(
+                "USER root",
+                f"RUN apt-get update || true ; {installs} ; rm -rf /var/lib/apt/lists/* || true",
+                "USER user",
+            ),
+        )
+
     async def _retry_bootstrap_from_stderr(self, stderr: str) -> bool:
         """Analyse stderr, build a patched image, and respawn once."""
         if not stderr:
@@ -443,8 +506,8 @@ class Sandbox:
             stderr_snippet=stderr,
         )
 
-        # Layer 2: dynamic heuristics
-        dynamic_pkgs = _apt_packages_from_stderr(stderr)
+        # Layer 2: dynamic apt heuristics (curated map + libY.so.N + best-effort).
+        apt_action = self._apt_bootstrap_action(stderr)
 
         extra_lines: list[str] = []
         extra_env: dict[str, str] = {}
@@ -457,17 +520,9 @@ class Sandbox:
                     extra_env.update(dict(action.env))
                     new_ids.append(action.action_id)
 
-        if dynamic_pkgs:
-            pkgs_str = " ".join(dynamic_pkgs)
-            extra_lines += [
-                "USER root",
-                (
-                    f"RUN apt-get update && apt-get install -y --no-install-recommends"
-                    f" {pkgs_str} && rm -rf /var/lib/apt/lists/*"
-                ),
-                "USER user",
-            ]
-            new_ids.append("dynamic:" + "+".join(dynamic_pkgs[:5]))
+        if apt_action is not None and apt_action.action_id not in current_ids:
+            extra_lines.extend(apt_action.dockerfile_lines)
+            new_ids.append(apt_action.action_id)
 
         if not extra_lines:
             log.debug(
@@ -824,7 +879,20 @@ class Sandbox:
                 source_signals=list(evidence.source_signals),
             )
 
-        plan = plan_bootstrap(self._server, runtime, evidence=evidence)
+        plan = plan_bootstrap(
+            self._server, runtime, evidence=evidence, stderr_snippet=self._prereq_hint,
+        )
+        if self._prereq_hint:
+            # Beyond recipe stderr-tokens: fold in apt packages the error text
+            # names directly (``X: command not found``, missing ``.so``), so a
+            # prerequisite that has no recipe still gets installed.
+            apt_action = self._apt_bootstrap_action(self._prereq_hint)
+            if apt_action is not None:
+                actions = (*(plan.actions if plan else ()), apt_action)
+                reason = ", ".join(
+                    p for p in [(plan.reason if plan else None), apt_action.description] if p
+                )
+                plan = BootstrapPlan(actions=actions, reason=reason)
         self._bootstrap_plan = plan
         if plan is None:
             return

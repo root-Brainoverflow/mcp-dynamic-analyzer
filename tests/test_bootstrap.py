@@ -169,6 +169,46 @@ def test_fallback_playwright_detection_still_works_without_manifest() -> None:
     assert plan.actions[0].action_id.startswith("playwright-node")
 
 
+def test_system_chrome_for_cdp_servers() -> None:
+    """Servers using puppeteer-core / chrome-launcher expect a system Google
+    Chrome at /opt/google/chrome/chrome. The planner installs it — eagerly at
+    preflight when one of those CDP libs is in the resolved deps, and reactively
+    from a 'could not find Chrome' error fed back by the orchestrator. No server
+    name is hardcoded."""
+    runtime = ResolvedRuntime(image="mcp-sandbox-node22", command="npx", reason="npx -> node22")
+
+    # eager: puppeteer-core in the resolved dependencies (npm-view / manifest)
+    plan = plan_bootstrap(
+        ServerConfig(command="npx", args=["-y", "chrome-devtools-mcp@latest"]), runtime,
+        evidence=PreflightEvidence(source="npm-view:chrome-devtools-mcp", package_name="chrome-devtools-mcp",
+                                   node_dependencies=(("puppeteer-core", "^24.0.0"),)),
+    )
+    assert plan is not None and any(a.action_id == "system-chrome" for a in plan.actions)
+    df = render_bootstrap_dockerfile(runtime.image, plan)
+    # the recipe must actually put Chrome at /opt/google/chrome/chrome — that's
+    # where puppeteer-core / chrome-devtools-mcp look for "channel stable".
+    # amd64 path: Google's apt repo installs google-chrome-stable there natively
+    assert "google-chrome-stable" in df
+    assert "dl.google.com/linux/chrome/deb" in df
+    # arm64 fallback: Debian chromium symlinked into the same path so the
+    # existence check passes and CDP still works
+    assert "ln -sf /usr/bin/chromium /opt/google/chrome/chrome" in df
+    assert "/opt/google/chrome/chrome" in df
+    assert merged_bootstrap_env(plan).get("CHROME_PATH") == "/opt/google/chrome/chrome"
+
+    # reactive: a "could not find Google Chrome" error re-resolves to it even for
+    # a server with no chrome-related name or declared dependency
+    plan2 = plan_bootstrap(
+        ServerConfig(command="npx", args=["some-headless-thing"]), runtime,
+        stderr_snippet="Could not find Google Chrome executable for channel 'stable' at: /opt/google/chrome/chrome.",
+    )
+    assert plan2 is not None and any(a.action_id == "system-chrome" for a in plan2.actions)
+
+    # negative: an unrelated node server must NOT trigger a Chrome install
+    plan3 = plan_bootstrap(ServerConfig(command="npx", args=["-y", "@modelcontextprotocol/server-memory"]), runtime)
+    assert plan3 is None or not any(a.action_id == "system-chrome" for a in plan3.actions)
+
+
 def test_python_playwright_dependency_emits_python_hook() -> None:
     server = ServerConfig(command="uvx", args=["some-python-mcp"])
     runtime = ResolvedRuntime(

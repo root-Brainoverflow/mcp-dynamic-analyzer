@@ -68,12 +68,28 @@ class Reporter:
         lines: list[str] = []
 
         # ── Header ────────────────────────────────────────────────────
+        # Server identity: prefer the MCP server's self-declared name from
+        # its `initialize` reply (e.g. `drawio-mcp 1.0.0`), with the launch
+        # command kept parenthetically so "what we actually ran" stays
+        # visible. Falls back to just the launcher when no handshake
+        # succeeded (server crashed at startup, no tools discovered).
+        srv = output.server
+        name = srv.get("name") or "unknown"
+        version = srv.get("version") or ""
+        launcher = srv.get("command") or ""
+        launcher_args = " ".join(srv.get("args") or [])
+        launcher_line = f"{launcher} {launcher_args}".strip()
+        if name == launcher or not name or name == "unknown":
+            server_line = f"`{launcher_line or name}`"
+        else:
+            ident = f"{name} {version}".rstrip()
+            server_line = f"`{ident}` (via `{launcher_line}`)" if launcher_line else f"`{ident}`"
         lines += [
             "# MCP Dynamic Analyzer — Security Report",
             "",
             f"**Session:** `{output.session_id}`  ",
             f"**Generated:** {now}  ",
-            f"**Server:** `{output.server.get('name', 'unknown')} {output.server.get('version', '')}`  ",
+            f"**Server:** {server_line}  ",
             f"**Event log:** `{output.event_log_path}`  ",
             "",
         ]

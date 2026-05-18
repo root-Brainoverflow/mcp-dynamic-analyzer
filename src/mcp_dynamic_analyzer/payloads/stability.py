@@ -26,6 +26,7 @@ Payload categories:
 from __future__ import annotations
 
 import base64
+import re
 from typing import Any
 
 # Threshold above which a tool call is considered suspiciously slow. R6's
@@ -410,3 +411,61 @@ def looks_like_parser_failure(response_text: str) -> bool:
 def looks_like_crash(response_text: str) -> bool:
     lower = response_text.lower()
     return any(ind in lower for ind in CRASH_INDICATORS)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Missing runtime prerequisite — the server is up but its tools repeatedly fail
+# because a binary / browser / module they need isn't installed in the sandbox.
+# Used by the orchestrator (to trigger a "install it and re-run" pass) and by
+# R6 (to surface a clear coverage caveat when it couldn't be auto-installed).
+# ─────────────────────────────────────────────────────────────────────────────
+
+MISSING_PREREQUISITE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"could not find (?:google )?chrome", re.IGNORECASE),
+    re.compile(r"browsertype\.launch:\s*executable doesn't exist", re.IGNORECASE),
+    re.compile(r"executable doesn't exist at\b", re.IGNORECASE),
+    re.compile(r'run\s+"?(?:npx )?playwright install"?', re.IGNORECASE),
+    re.compile(r"chromium distribution '[^']+' is not found", re.IGNORECASE),
+    re.compile(r"no module named ['\"]?([\w.\-]+)", re.IGNORECASE),
+    re.compile(r"cannot find module ['\"]([^'\"]+)['\"]", re.IGNORECASE),
+    re.compile(r"\bspawn\s+(\S+)\s+enoent\b", re.IGNORECASE),
+    re.compile(r"\bcommand not found\b", re.IGNORECASE),
+    re.compile(r"(?m)^([\w.\-/]+):\s+not found\b", re.IGNORECASE),
+    re.compile(r"\b(?:is not installed|not installed; please|please install)\b", re.IGNORECASE),
+)
+
+# Patterns that *also* capture the missing component's name in group 1, plus a
+# few extra name-only patterns. Tried in order; first capturing match wins.
+_PREREQ_NAME_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"could not find (google chrome)", re.IGNORECASE),
+    re.compile(r"no module named ['\"]?([\w][\w.\-]*)", re.IGNORECASE),
+    re.compile(r"cannot find module ['\"]([^'\"/][^'\"]*)['\"]", re.IGNORECASE),
+    re.compile(r"\bspawn\s+([\w.\-/]+)\s+enoent\b", re.IGNORECASE),
+    re.compile(r"['\"]?([\w][\w.\-]*?)['\"]?:\s+command not found", re.IGNORECASE),
+    re.compile(r"(?m)^['\"]?([\w][\w.\-]*?)['\"]?:\s+not found\b", re.IGNORECASE),
+    re.compile(r"\bexecutable\s+['\"]?([\w][\w.\-/]*)['\"]? (?:doesn't exist|not found)", re.IGNORECASE),
+)
+
+
+def looks_like_missing_prerequisite(response_text: str) -> bool:
+    """True iff *response_text* reads like "a binary / browser / module the
+    server's tool needs isn't installed"."""
+    return bool(response_text) and any(p.search(response_text) for p in MISSING_PREREQUISITE_PATTERNS)
+
+
+def missing_prerequisite_name(response_text: str) -> str | None:
+    """Best-effort extract the name of the missing component from an error
+    string (``geckodriver``, ``spotipy``, ``google chrome`` …), or ``None``."""
+    if not response_text:
+        return None
+    for p in _PREREQ_NAME_PATTERNS:
+        m = p.search(response_text)
+        if m and m.group(1):
+            name = m.group(1).strip().strip("'\"")
+            # last path component for ``/usr/bin/foo`` — but keep npm scoped
+            # package names (``@scope/pkg``) intact.
+            if not name.startswith("@"):
+                name = name.rsplit("/", 1)[-1] or name
+            if name:
+                return name
+    return None

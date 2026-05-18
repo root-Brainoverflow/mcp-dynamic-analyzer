@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -16,6 +17,10 @@ from mcp_dynamic_analyzer.infrastructure.netmon import NetworkMonitor
 from mcp_dynamic_analyzer.infrastructure.sandbox import Sandbox, generate_env_variation
 from mcp_dynamic_analyzer.infrastructure.sysmon import SystemMonitor, SysmonUnavailableError
 from mcp_dynamic_analyzer.models import AnalysisContext, AnalysisOutput, Event, Finding, ServerCrashError, ToolInfo
+from mcp_dynamic_analyzer.payloads.stability import (
+    looks_like_missing_prerequisite,
+    missing_prerequisite_name,
+)
 from mcp_dynamic_analyzer.protocol.client import McpClient
 from mcp_dynamic_analyzer.protocol.http_interceptor import HttpInterceptor
 from mcp_dynamic_analyzer.protocol.interceptor import StdioInterceptor
@@ -30,6 +35,12 @@ from mcp_dynamic_analyzer.scanners.r5_input_validation import FuzzingSequence, R
 from mcp_dynamic_analyzer.scanners.r6_stability import R6StabilityScanner, StabilityFuzzingSequence
 
 log = structlog.get_logger()
+
+# Events from the collection re-run that follows a "missing prerequisite" auto-
+# install get this ``variation_tag`` so the post-retry "is it still broken?"
+# check inspects *only that re-run* — a successful fix isn't masked by the
+# degraded first run still sitting in the event log.
+_PREREQ_RETRY_TAG = "prereq-retry"
 
 
 class _TaggedWriter:
@@ -94,6 +105,7 @@ async def run_analysis(
     output_dir = Path(config.output.output_dir) / session_id
     event_store = EventStore(output_dir)
     tools: list[ToolInfo] = []
+    started_at = time.monotonic()
 
     log.info("orchestrator.collection.start", session_id=session_id)
 
@@ -181,6 +193,16 @@ async def run_analysis(
         existing = set(merged_static.get("trusted_internal_ips") or [])
         merged_static["trusted_internal_ips"] = sorted(existing | trusted_internal_ips)
 
+    # The server's self-declared identity (from its ``initialize`` reply) is
+    # used by tool-capability classification — ``wikipedia-mcp`` should
+    # classify its ``search`` tool as a retrieval tool even when the tool's
+    # own description is terse. Pulled from event-store here rather than from
+    # ``config.server.command`` so we get the *actual* serverInfo.name, not
+    # the harness command (``uvx``, ``npx``, ``docker``).
+    discovered_for_ctx = await _extract_server_info(reader)
+    if discovered_for_ctx.get("name"):
+        merged_static["server_name"] = discovered_for_ctx["name"]
+
     ctx = AnalysisContext(
         session_id=session_id,
         event_reader=reader,
@@ -213,14 +235,27 @@ async def run_analysis(
     scoring_result = Scorer().score(correlated)
     event_count = await reader.count()
 
+    # Prefer the server's self-declared identity from its `initialize` reply
+    # (e.g. ``drawio-mcp``, ``chrome_devtools``, ``n8n-documentation-mcp``)
+    # over the raw launch command (``npx``, ``docker``, ``uvx``) — the latter
+    # is just the harness, not the server. Falls back to the command if the
+    # initialize handshake never produced a serverInfo (server crashed at
+    # startup, no tools discovered, ...).
+    discovered = await _extract_server_info(reader)
     output = AnalysisOutput(
         session_id=session_id,
-        server={"name": config.server.command, "version": "", "args": config.server.args},
+        server={
+            "name": discovered.get("name") or config.server.command,
+            "version": discovered.get("version", ""),
+            "title": discovered.get("title", ""),
+            "command": config.server.command,
+            "args": config.server.args,
+        },
         findings=correlated,
         event_log_path=str(event_store.events_path),
         dynamic_risk_scores=scoring_result.per_risk,
         metadata={
-            "duration_sec": 0,
+            "duration_sec": time.monotonic() - started_at,
             "tools_tested": len(tools),
             "total_events": event_count,
         },
@@ -275,6 +310,16 @@ async def _collect(
         # tools, so re-firing the category elsewhere only burns more restart
         # budget for no new signal.
         crash_categories: set[str] = set()
+        # When the collected tool responses reveal a missing runtime
+        # prerequisite (the server stays up but is degraded — e.g.
+        # chrome-devtools-mcp without Chrome), this carries the offending
+        # response text to the *next* sandbox, which re-resolves it via the
+        # recipe stderr-tokens / apt heuristic, rebuilds the image, and the
+        # whole collection re-runs once. ``prereq_retry_done`` bounds it to one
+        # such retry per collection.
+        prereq_hint: str | None = None
+        prereq_retry_done = False
+        prereq_outcome_recorded = False
         sysmon_enabled = (
             config.scanners.r1_data_access.enabled
             or config.scanners.r2_code_exec.enabled
@@ -305,6 +350,7 @@ async def _collect(
                 honeypot_dir=honeypot_dir,
                 use_docker=use_docker,
                 sysmon_enabled=sysmon_enabled,
+                prereq_hint=prereq_hint,
             ) as sandbox:
                 # Capture sidecar IPs as soon as the sandbox is up — they
                 # exist for the duration of the ``async with`` block and
@@ -385,10 +431,135 @@ async def _collect(
                     await _stop_monitors(monitors, honeypot)
                     await interceptor.close()
 
+            # The server stayed up, but its tool responses look degraded by a
+            # missing runtime prerequisite (chrome-devtools-mcp without Chrome,
+            # a server whose tool shells out to a binary that isn't installed,
+            # …). Detect that *generically* from the collected responses, hand
+            # the offending text to the next sandbox (which re-resolves it via
+            # recipe ``stderr_tokens_any`` / the apt heuristic, rebuilds the
+            # image), and re-run the whole collection once.
+            if use_docker and not remaining and not prereq_retry_done:
+                hint = await _detect_missing_prerequisite(event_store.reader)
+                if hint:
+                    prereq_hint = hint
+                    prereq_retry_done = True
+                    remaining = list(sequences)
+                    # Tag the re-run's events so the post-retry check below can
+                    # tell "fixed" (the rebuilt-image re-run is clean) from
+                    # "still broken" (the re-run still fails for the same reason).
+                    writer = _TaggedWriter(base_writer, _PREREQ_RETRY_TAG)
+                    log.warning(
+                        "orchestrator.prerequisite_missing_retry",
+                        hint=hint[:240],
+                        note=(
+                            "Tool responses indicate a missing runtime prerequisite — "
+                            "rebuilding the sandbox image with the fix and re-running "
+                            "collection once."
+                        ),
+                    )
+
+            # The auto-install pass has run. If the *re-run* (tagged
+            # ``prereq-retry``) still shows the missing-prerequisite pattern —
+            # no recipe/apt fix was applicable, or it didn't take — record a
+            # ``prerequisite_missing`` event so the report carries a clear
+            # caveat. The scan still completes; it just couldn't exercise the
+            # tools that need the missing component, so the user knows exactly
+            # what's missing and that the verdict is partial.
+            if use_docker and prereq_retry_done and not remaining and not prereq_outcome_recorded:
+                prereq_outcome_recorded = True
+                still = await _detect_missing_prerequisite(
+                    event_store.reader, only_tag=_PREREQ_RETRY_TAG,
+                )
+                if still:
+                    name = missing_prerequisite_name(prereq_hint or still)
+                    await writer.write(Event(
+                        session_id=session_id,
+                        source="orchestrator",
+                        type="prerequisite_missing",
+                        data={"name": name, "hint": (prereq_hint or still)[:600]},
+                    ))
+                    log.warning(
+                        "orchestrator.prerequisite_unmet",
+                        name=name,
+                        note=(
+                            "Server tools still fail for a missing runtime prerequisite "
+                            "after the auto-install pass — scan ran with reduced coverage; "
+                            "report carries a caveat finding."
+                        ),
+                    )
+
         if honeypot is not None:
             honeypot.cleanup()
 
     return tools
+
+
+async def _detect_missing_prerequisite(
+    reader: Any,
+    *,
+    fraction: float = 0.25,
+    min_distinct_tools: int = 3,
+    only_tag: str | None = None,
+) -> str | None:
+    """Return one tool-response text revealing a missing runtime prerequisite,
+    or ``None``. Conservative: only fires when many responses across several
+    tools match, so one stray ``ModuleNotFoundError`` from a weird fuzz payload
+    doesn't trigger a wasteful image rebuild.
+
+    ``only_tag`` restricts the scan to ``test_result`` events carrying that
+    ``variation_tag`` — used for the *post-retry* "is it still broken?" check,
+    which inspects only the rebuilt-image re-run (tagged ``prereq-retry``) so a
+    successful fix isn't masked by the degraded first run still in the log.
+    """
+    total = 0
+    matched_count = 0
+    matched_tools: set[str] = set()
+    sample: str | None = None
+    async for evt in reader.events_by_type("test_result"):
+        if only_tag is not None and getattr(evt, "variation_tag", None) != only_tag:
+            continue
+        text = str(evt.data.get("response_preview", "") or "")
+        if not text:
+            continue
+        total += 1
+        if looks_like_missing_prerequisite(text):
+            matched_count += 1
+            matched_tools.add(str(evt.data.get("tool") or ""))
+            if sample is None:
+                sample = text[:600]
+    if total < 10 or sample is None:
+        return None
+    if len(matched_tools - {""}) >= min_distinct_tools or matched_count / total >= fraction:
+        return sample
+    return None
+
+
+async def _extract_server_info(reader: Any) -> dict[str, str]:
+    """Return the MCP server's self-declared identity from the first
+    ``initialize`` reply seen in the event log.
+
+    MCP servers populate ``result.serverInfo`` in their ``initialize``
+    response with ``{name, version, title?}``. We surface those in the final
+    report's ``Server:`` line so it reads like
+    ``drawio-mcp 1.0.0`` instead of ``npx`` (which is just the launcher).
+    Returns an empty dict if the handshake never produced a serverInfo —
+    callers should fall back to the launch command for the ``name`` field.
+    """
+    async for evt in reader.events_by_type("mcp_response"):
+        msg = evt.data.get("message")
+        if not isinstance(msg, dict):
+            continue
+        info = (msg.get("result") or {}).get("serverInfo")
+        if not isinstance(info, dict):
+            continue
+        out: dict[str, str] = {}
+        for key in ("name", "version", "title"):
+            value = info.get(key)
+            if isinstance(value, str) and value:
+                out[key] = value
+        if out.get("name"):
+            return out
+    return {}
 
 
 async def _read_tools_from_events(reader: Any) -> list[ToolInfo]:

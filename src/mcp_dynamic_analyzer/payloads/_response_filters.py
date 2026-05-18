@@ -146,29 +146,54 @@ def is_clean_success_envelope(response_text: str) -> bool:
 def is_handled_tool_error(response_text: str) -> bool:
     """True iff the response is an error the server *caught and returned*.
 
-    FastMCP-style servers wrap a tool-handler exception as
-    ``{"content": [{"type": "text", "text": "Error executing tool <name>: <exc>"}], "isError": true}``.
-    When such a wrapper carries an OOM / stack-overflow / abort-looking
-    message, that message is a *handled* exception — the process is alive and
-    reporting an error, not a real process crash / unbounded OOM. R6 should
-    still surface it, but at a lower severity than an *unhandled* malfunction
-    (raw traceback, segfault, ...); R5's "unhandled error" check should skip it
-    entirely (there's nothing unhandled about a caught-and-returned exception).
+    Three shapes count as "handled":
+
+    1. **FastMCP** wraps a tool-handler exception as ``{"content": [{"type":
+       "text", "text": "Error executing tool <name>: <exc>"}], "isError": true}``.
+    2. **isError flag** on any structured result.
+    3. **JSON-RPC error envelope** — the server sent a proper ``-32xxx``
+       error response. Our McpClient stringifies these as ``McpError(<code>):
+       <message>`` before they reach the scanner; outcome is set to
+       ``server_error``. A JSON-RPC error response IS the server choosing to
+       report a failure at the protocol level — the process is alive and
+       protocol-compliant, even when the message includes a leaked stack
+       trace (a stack trace inside a ``-32603 Internal error`` response is
+       an *info-disclosure* concern, not an *unhandled* crash).
+
+    When the response carries an OOM / stack-overflow / abort-looking message,
+    that message is a *handled* exception — the process is alive and reporting
+    an error, not a real process crash / unbounded OOM. R6 should still surface
+    it, but at a lower severity than an *unhandled* malfunction (raw traceback,
+    segfault, ...); R5's "unhandled error" check should skip it entirely
+    (there's nothing unhandled about a caught-and-returned exception).
     """
     if not response_text:
         return False
     low = response_text.lower()
-    # Strong, specific signal: the FastMCP wrapper phrase + an error envelope.
+    # 1. FastMCP wrapper.
     if "error executing tool" in low and ('"iserror": true' in low or '"iserror":true' in low):
         return True
-    # General: parses as a dict the server explicitly flagged as an error. An
-    # ``isError: true`` response *is* the server choosing to report rather than
-    # crash — that's "handled" for our purposes.
+    # 3. JSON-RPC error envelope stringified by our client.
+    # ses-c392aa7f regression: @antv/mcp-server-chart returned -32603 for
+    # malformed chart data, the response carried a TypeError stack trace,
+    # and R5 fired "Unhandled error" on 23 different chart tools.
+    if low.startswith("mcperror("):
+        return True
+    # 2. General: parses as a dict the server explicitly flagged as an error.
     try:
         obj = json.loads(response_text)
     except (json.JSONDecodeError, ValueError):
         return False
-    return isinstance(obj, dict) and obj.get("isError") is True
+    if not isinstance(obj, dict):
+        return False
+    if obj.get("isError") is True:
+        return True
+    # 3b. Raw JSON-RPC error envelope (the server's bytes, not yet client-
+    # stringified) — ``{"jsonrpc":"2.0","id":N,"error":{"code":N,"message":...}}``.
+    err = obj.get("error")
+    if isinstance(err, dict) and "code" in err and obj.get("jsonrpc"):
+        return True
+    return False
 
 
 def strip_input_echoes(response_text: str) -> str:
@@ -201,6 +226,85 @@ _SLASH_RUN_RE = re.compile(r"/{2,}")
 _BACKSLASH_RUN_RE = re.compile(r"\\{2,}")
 _WS_RUN_RE = re.compile(r"\s{2,}")
 _ESCAPE_RE = re.compile(r"\\(.)")
+
+# Characters servers commonly split input on before extracting a sub-token:
+# path components (``/`` ``\``), URL/scheme markers (``:``), whitespace, quotes,
+# and JSON / YAML structural punctuation. Used to find the boundary of a
+# canary-bearing chunk that may surface outside the literal payload echo.
+_PAYLOAD_BOUNDARY_CHARS = frozenset("/\\:'\"`<>{}[]() \t\n\r,;")
+
+
+def _canary_wrapper_variants(payload_repr: str) -> list[str]:
+    """Substrings of *payload_repr* that surround a known RCE canary.
+
+    The full-payload mask catches the common case ``response.find(payload)``,
+    but servers that **split** the payload on a separator and keep only one
+    chunk — ``os.path.basename(...)``, ``urllib.parse.urlparse(...).path``,
+    ``shlex.split(...)[-1]`` — surface that chunk in the response *outside*
+    any literal payload echo. The canary inside that chunk then trips
+    ``looks_like_rce_success`` on pure reflection.
+
+    Regression: ses-45ee8108 — Ghidra ran ``os.path.basename`` on the JNDI
+    payload ``${jndi:ldap://.../RCE_CANARY_7f3a9c}`` and reported the
+    trailing segment ``RCE_CANARY_7f3a9c}`` as a not-found filename. Three
+    CRITICAL R2 findings on what was actually 100% reflection.
+
+    For each canary occurrence in the payload, two wrapper variants are
+    emitted:
+
+      * **Right-sep only** — ``CANARY<right_boundary>`` (e.g. ``CANARY}``,
+        ``CANARY'``, ``CANARY)``). The right boundary char distinguishes a
+        reflected fragment from real command output, which usually ends in
+        a newline / EOF, not in a payload structural char.
+      * **Both-sides** — ``<left_boundary>CANARY<right_boundary>``, kept for
+        added specificity when the right-sep alone might still be ambiguous.
+
+    Left-sep-only is deliberately NOT emitted: payload canaries are
+    commonly preceded by whitespace (``'echo CANARY``), and real exploit
+    output is ALSO commonly preceded by whitespace (``Output: CANARY``).
+    Masking ``<space>CANARY`` would silence real exploit hits.
+
+    ``RCE_INDICATORS`` is imported lazily to avoid a circular import with
+    ``rce.py`` (which itself imports ``strip_input_echoes`` from here).
+    """
+    from mcp_dynamic_analyzer.payloads.rce import RCE_INDICATORS
+
+    variants: list[str] = []
+    seen: set[str] = set()
+    for canary in RCE_INDICATORS:
+        if len(canary) < 4:
+            continue
+        start = 0
+        while True:
+            idx = payload_repr.find(canary, start)
+            if idx == -1:
+                break
+            inner_left = idx
+            inner_right = idx + len(canary)
+            # Expand into the non-separator run that surrounds the canary
+            # (servers sometimes echo the canary plus a couple of adjacent
+            # payload chars but stop before the next separator).
+            while inner_left > 0 and payload_repr[inner_left - 1] not in _PAYLOAD_BOUNDARY_CHARS:
+                inner_left -= 1
+            while inner_right < len(payload_repr) and payload_repr[inner_right] not in _PAYLOAD_BOUNDARY_CHARS:
+                inner_right += 1
+            # Add one separator char beyond the inner run on each side.
+            outer_left = inner_left - 1 if inner_left > 0 else inner_left
+            outer_right = inner_right + 1 if inner_right < len(payload_repr) else inner_right
+            # Right-sep-only wrapper: from canary start to outer_right.
+            right_only = payload_repr[idx:outer_right]
+            # Both-sides wrapper: from outer_left to outer_right.
+            both = payload_repr[outer_left:outer_right]
+            for w in (right_only, both):
+                if (
+                    len(w) > len(canary)
+                    and len(w) >= _MIN_REFLECTION_LEN
+                    and w not in seen
+                ):
+                    seen.add(w)
+                    variants.append(w)
+            start = idx + 1
+    return variants
 
 
 def _collapse_escapes(text: str, passes: int = 5) -> str:
@@ -275,6 +379,10 @@ def _payload_echo_variants(payload_repr: str) -> list[str]:
     _add(_WS_RUN_RE.sub(" ", payload_repr))
     # Combined slash + whitespace collapse.
     _add(_WS_RUN_RE.sub(" ", _SLASH_RUN_RE.sub("/", payload_repr)))
+    # Canary-bearing wrapper substrings — for servers that split the payload
+    # on a separator and only echo the chunk around the canary.
+    for wrapper in _canary_wrapper_variants(payload_repr):
+        _add(wrapper)
     # ``repr()``-escaped form, and that form once more JSON-encoded (the
     # preview is JSON, so an already-escaped echo gets its backslash doubled).
     esc = _escape_variant(payload_repr)

@@ -329,21 +329,45 @@ def test_r5_check_skips_client_outcome_field() -> None:
     assert result is None
 
 
-def test_r5_check_processes_server_error_outcome() -> None:
-    """``server_error`` (JSON-RPC error response from server) is still
-    server-originated, so indicator matching against it is valid."""
+def test_r5_check_does_not_fire_unhandled_on_jsonrpc_error_envelope() -> None:
+    """ses-c392aa7f regression: @antv/mcp-server-chart returned proper
+    JSON-RPC -32603 error envelopes (our client stringified them as
+    ``McpError(-32603): ...TypeError: cannot read properties of null...``)
+    for every malformed chart payload, and R5 fired "Unhandled error" on
+    23 different chart tools because the response contained TypeError +
+    cannot-read-property indicators. But the server is alive and
+    protocol-compliant — it CHOSE to report the failure via JSON-RPC error,
+    that's a *handled* error in every sense that matters for R5's
+    "unhandled error" check. The stack trace inside the error response is a
+    separate info-disclosure concern, not an unhandled crash."""
     from mcp_dynamic_analyzer.scanners.r5_input_validation import R5InputValidationScanner
     scanner = R5InputValidationScanner()
-    server_err = "McpError(-32000): TypeError: cannot read property"
+    server_err = (
+        "McpError(-32603): MCP error -32603: Failed to generate chart: "
+        "Cannot read properties of null (reading 'map')\n"
+        "TypeError: Cannot read properties of null (reading 'map')\n"
+        "    at <anonymous> (/var/task/code/ApiControlleroneclipPost.ts:13:66)"
+    )
     result = scanner._check(
-        category="type_mismatch_number",
+        category="sql_injection",
         response=server_err,
-        tool_name="x",
-        event_id="evt-2",
+        tool_name="generate_area_chart",
+        event_id="evt-x",
         outcome="server_error",
     )
-    assert result is not None
-    assert "Unhandled error" in result.title
+    assert result is None
+
+
+def test_is_handled_tool_error_recognises_jsonrpc_error_envelope() -> None:
+    """Both the client-stringified form (``McpError(code): ...``) and the
+    raw JSON-RPC error envelope (``{"jsonrpc":"2.0","id":N,"error":...}``)
+    count as handled — the server emitted a proper protocol-level error
+    response either way."""
+    from mcp_dynamic_analyzer.payloads._response_filters import is_handled_tool_error
+    assert is_handled_tool_error("McpError(-32603): something blew up") is True
+    assert is_handled_tool_error('{"jsonrpc":"2.0","id":1,"error":{"code":-32603,"message":"x"}}') is True
+    # Negative: non-MCP error-shaped text remains unhandled-looking
+    assert is_handled_tool_error("TypeError: cannot read x\n    at foo (bar.js:1)") is False
 
 
 # ---- generic payload-echo reflection guard (server-agnostic) ---------------
@@ -499,6 +523,144 @@ def test_strip_payload_echo_handles_whitespace_collapse() -> None:
     response = "rejected input: 'a b RCE_CANARY_7f3a9c c' — not allowed"  # collapsed
     masked = strip_payload_echo(response, payload)
     assert "RCE_CANARY_7f3a9c" not in masked
+
+
+def test_strip_payload_echo_handles_path_basename_extraction() -> None:
+    """Servers that run input through ``os.path.basename`` / ``urllib.parse``
+    surface only the trailing path segment in the response, outside any
+    literal full-payload echo.
+
+    Regression: ses-45ee8108 — Ghidra's ``run_script_inline`` treated
+    ``${jndi:ldap://.../RCE_CANARY_7f3a9c}`` as a script filename, ran
+    ``os.path.basename`` on it, and reported the trailing segment
+    ``RCE_CANARY_7f3a9c}`` as a not-found filename. The whole-payload mask
+    missed it, the canary survived, and ``looks_like_rce_success`` matched
+    on pure reflection — three CRITICAL R2 false positives on what was
+    100 %% rejection.
+    """
+    from mcp_dynamic_analyzer.payloads._response_filters import strip_payload_echo
+    from mcp_dynamic_analyzer.payloads.rce import looks_like_rce_success
+    payload = "${jndi:ldap://127.0.0.1:1389/RCE_CANARY_7f3a9c}"
+    response = (
+        "Script: ${jndi:ldap://127.0.0.1:1389/RCE_CANARY_7f3a9c}\n"
+        "ERROR: Script file not found. Searched:\n"
+        "  - /Users/woojin/ghidra_scripts/RCE_CANARY_7f3a9c}\n"
+        "  - ./ghidra_scripts/RCE_CANARY_7f3a9c}\n"
+    )
+    masked = strip_payload_echo(response, payload)
+    assert "RCE_CANARY_7f3a9c" not in masked
+    assert looks_like_rce_success(masked) is False
+
+
+def test_strip_payload_echo_handles_yaml_basename_extraction() -> None:
+    """Same FP class as the JNDI case, with a YAML deserialise payload.
+    The path-join keeps the trailing ``CANARY']`` chunk — the right-sep
+    wrapper (canary + apostrophe) catches it without touching real
+    command-output canaries (which lack the trailing quote)."""
+    from mcp_dynamic_analyzer.payloads._response_filters import strip_payload_echo
+    from mcp_dynamic_analyzer.payloads.rce import looks_like_rce_success
+    payload = "!!python/object/apply:os.system ['echo RCE_CANARY_7f3a9c']"
+    response = (
+        "Script: !!python/object/apply:os.system ['echo RCE_CANARY_7f3a9c']\n"
+        "ERROR: Script file not found. Searched:\n"
+        "  - /scripts/RCE_CANARY_7f3a9c']\n"
+    )
+    masked = strip_payload_echo(response, payload)
+    assert "RCE_CANARY_7f3a9c" not in masked
+    assert looks_like_rce_success(masked) is False
+
+
+def test_canary_wrapper_does_not_mask_bare_canary_output() -> None:
+    """Real exploit output (``Output: CANARY\\n``) must survive: the
+    canary appears with leading whitespace and a newline, neither of
+    which matches the payload's wrapping (``'echo CANARY')`` — apostrophe
+    after canary).
+
+    This is the discriminator that lets ``_canary_wrapper_variants`` mask
+    reflection without killing real RCE detections."""
+    from mcp_dynamic_analyzer.payloads._response_filters import strip_payload_echo
+    from mcp_dynamic_analyzer.payloads.rce import looks_like_rce_success
+    payload = "__import__('os').system('echo RCE_CANARY_7f3a9c')"
+    response = "Output: RCE_CANARY_7f3a9c\n"
+    masked = strip_payload_echo(response, payload)
+    assert "RCE_CANARY_7f3a9c" in masked
+    assert looks_like_rce_success(masked) is True
+
+
+def test_r2_rce_check_silenced_for_path_basename_extraction() -> None:
+    """End-to-end: R2 ``_check_rce_responses`` must not fire on the
+    Ghidra basename-extraction reflection (ses-45ee8108)."""
+    import asyncio
+    from mcp_dynamic_analyzer.models import Event
+    from mcp_dynamic_analyzer.scanners.r2_code_exec import R2CodeExecScanner
+
+    payload = "${jndi:ldap://127.0.0.1:1389/RCE_CANARY_7f3a9c}"
+    response = (
+        '{"content": [{"type": "text", "text": "=== GHIDRA SCRIPT EXECUTION ===\\n'
+        'Script: ${jndi:ldap://127.0.0.1:1389/RCE_CANARY_7f3a9c}\\n'
+        'ERROR: Script file not found. Searched:\\n'
+        '  - /Users/woojin/ghidra_scripts/RCE_CANARY_7f3a9c}\\n'
+        '  - ./ghidra_scripts/RCE_CANARY_7f3a9c}"}], "isError": false}'
+    )
+    evt = Event(session_id="s", source="test", type="test_result", data={
+        "tool": "run_script_inline", "category": "rce_jndi",
+        "response_preview": response, "outcome": "server_response",
+        "payload_repr": payload,
+    })
+
+    class _StubReader:
+        async def events_by_type(self, t: str):
+            if t == "test_result":
+                yield evt
+
+    class _Ctx:
+        event_reader = _StubReader()
+        tools: list = []
+
+    findings = asyncio.run(R2CodeExecScanner()._check_rce_responses(_Ctx()))
+    assert findings == []
+
+
+def test_r5_no_longer_fires_on_rce_categories() -> None:
+    """ses-45ee8108: R2 and R5 both ran ``looks_like_rce_success`` on the
+    same test_result events, producing duplicate findings (one R2 with the
+    category label, one R5 with none). R5 is now bounded to the input-
+    handling axis (SQL/NoSQL/path/type-confusion) and defers code-execution
+    detection to R2."""
+    import asyncio
+    from mcp_dynamic_analyzer.correlation.event_store import EventStore
+    from mcp_dynamic_analyzer.models import AnalysisContext, Event
+    from mcp_dynamic_analyzer.scanners.r5_input_validation import R5InputValidationScanner
+    import tempfile, pathlib
+
+    # Build a synthetic context with a single rce_jndi test_result that *would*
+    # have matched looks_like_rce_success (the FP shape from ses-45ee8108).
+    with tempfile.TemporaryDirectory() as td:
+        store = EventStore(pathlib.Path(td))
+
+        async def go() -> list:
+            async with store.writer as w:
+                await w.write(Event(
+                    session_id="s", source="test", type="test_result",
+                    data={
+                        "tool": "run_script_inline", "category": "rce_jndi",
+                        "outcome": "server_response",
+                        "response_preview": (
+                            "Output: RCE_CANARY_7f3a9c\n"  # bare canary, no wrapper
+                        ),
+                        "payload_repr": "${jndi:ldap://.../RCE_CANARY_7f3a9c}",
+                        "sequence": "fuzz_input_validation",
+                    },
+                ))
+            ctx = AnalysisContext(
+                session_id="s", event_reader=store.reader, tools=[],
+            )
+            return await R5InputValidationScanner().analyze(ctx)
+
+        findings = asyncio.run(go())
+        # Even though the response carries a bare canary, R5 must not produce
+        # an RCE finding — R2 owns that axis.
+        assert not any("RCE" in f.title for f in findings)
 
 
 def test_r2_rce_check_silenced_for_slash_normalized_jndi_echo() -> None:
@@ -800,3 +962,169 @@ def test_handled_recursion_in_fastmcp_wrapper_is_not_unhandled_error_for_r5() ->
     assert looks_like_unhandled_error(resp) is True
     # ...but it's a handled (caught + returned) error, so R5 must skip it
     assert is_handled_tool_error(resp) is True
+
+
+# ---- SQL/NoSQL "error leak" clean-envelope gate ----------------------------
+
+
+def test_r5_sql_error_keyword_in_clean_envelope_is_not_a_leak() -> None:
+    """ses-121a3dbc regression: n8n-mcp's ``search_templates`` returned a
+    workflow list whose ``items[*].name`` included "Generate & Test SQL Code
+    with GPT/OpenRouter AI and PostgreSQL Sandbox". The plain ``postgresql``
+    substring triggered ``looks_like_sql_error`` → HIGH FP. With the
+    clean-envelope gate, a successful tool response (isError != true) that
+    merely *mentions* SQL keywords in its data must not be flagged."""
+    from mcp_dynamic_analyzer.scanners.r5_input_validation import R5InputValidationScanner
+    scanner = R5InputValidationScanner()
+    clean_response = (
+        '{"content": [{"type": "text", "text": "{\\n  \\"items\\": [\\n    {\\n'
+        '      \\"id\\": 6583,\\n      \\"name\\": \\"Generate & Test SQL Code '
+        "with GPT/OpenRouter AI and PostgreSQL Sandbox\\\",\\n      "
+        "\\\"description\\\": \\\"...\\\"\\n    }\\n  ]\\n}\"}]}"
+    )
+    result = scanner._check(
+        category="sql_injection",
+        response=clean_response,
+        tool_name="search_templates",
+        event_id="evt-1",
+        outcome="server_response",
+    )
+    assert result is None
+
+
+def test_r5_sql_error_in_actual_error_envelope_still_flagged() -> None:
+    """The clean-envelope gate must not blind us to real SQL error leaks.
+    A response with ``isError: true`` carrying database-error text is the
+    canonical leak shape and stays flagged HIGH."""
+    from mcp_dynamic_analyzer.scanners.r5_input_validation import R5InputValidationScanner
+    scanner = R5InputValidationScanner()
+    error_response = (
+        '{"content": [{"type": "text", "text": "psycopg2.errors.SyntaxError: '
+        "syntax error at or near \\\"'\\\"\\nLINE 1: SELECT * FROM users WHERE name='\\\\'\"}],"
+        ' "isError": true}'
+    )
+    result = scanner._check(
+        category="sql_injection",
+        response=error_response,
+        tool_name="search_users",
+        event_id="evt-2",
+        outcome="server_response",
+    )
+    assert result is not None
+    assert "SQL error leaked" in result.title
+
+
+def test_r5_nosql_error_keyword_in_clean_envelope_is_not_a_leak() -> None:
+    """Same gate, NoSQL side. n8n-mcp's template descriptions include
+    workflow text that mentions ``syntax error``, ``compile error``,
+    ``loading``, ``did you mean`` — all NOSQL_ERROR_INDICATORS substrings —
+    in legitimate template documentation. Without the gate, almost any
+    template-search response would FP."""
+    from mcp_dynamic_analyzer.scanners.r5_input_validation import R5InputValidationScanner
+    scanner = R5InputValidationScanner()
+    clean_response = (
+        '{"content": [{"type": "text", "text": "{\\n  \\"items\\": [\\n    {\\n'
+        '      \\"id\\": 4627,\\n      \\"name\\": \\"Discover Hidden Website API '
+        "Endpoints Using Regex and AI\\\",\\n      \\\"description\\\": \\\"... "
+        "loading state with compile error retries ... did you mean ...\\\"\\n    }\\n  ]\\n}\"}]}"
+    )
+    result = scanner._check(
+        category="nosql_operator",
+        response=clean_response,
+        tool_name="search_templates",
+        event_id="evt-3",
+        outcome="server_response",
+    )
+    assert result is None
+
+
+def test_r5_nosql_error_in_actual_error_envelope_still_flagged() -> None:
+    """Genuine NoSQL backend error inside an error envelope stays HIGH."""
+    from mcp_dynamic_analyzer.scanners.r5_input_validation import R5InputValidationScanner
+    scanner = R5InputValidationScanner()
+    error_response = (
+        '{"content": [{"type": "text", "text": "MongoError: BSONObj size: '
+        "must be in range; query_shard_exception thrown\"}],"
+        ' "isError": true}'
+    )
+    result = scanner._check(
+        category="nosql_operator",
+        response=error_response,
+        tool_name="find_user",
+        event_id="evt-4",
+        outcome="server_response",
+    )
+    assert result is not None
+    assert "NoSQL error leaked" in result.title
+
+
+def test_r5_nosql_leak_indicator_still_fires_in_clean_envelope() -> None:
+    """``looks_like_nosql_leak`` is an *exploitation-success* indicator (the
+    response carries over-broad query data — ``isAdmin:true``, ``_id`` bulk
+    dumps). Those legitimately appear inside clean success envelopes (the
+    exploit succeeded, server returned the data without error), so the
+    clean-envelope gate must NOT apply to this branch."""
+    from mcp_dynamic_analyzer.scanners.r5_input_validation import R5InputValidationScanner
+    scanner = R5InputValidationScanner()
+    # Direct JSON document (no inner-string escaping) so the NOSQL_LEAK_INDICATORS
+    # substrings ('"_id"', '"isAdmin":true', '"role":"admin"') actually match.
+    leak_response = '{"_id":"abc","isAdmin":true,"role":"admin"}'
+    result = scanner._check(
+        category="nosql_operator",
+        response=leak_response,
+        tool_name="search",
+        event_id="evt-5",
+        outcome="server_response",
+    )
+    assert result is not None
+    assert "NoSQL injection data leak" in result.title
+
+
+def test_math_canary_alone_is_not_rce_evidence() -> None:
+    """``9359`` (``MATH_CANARY``) is sent as a probe (``{{1337*7}}`` proves
+    template eval), but matching the bare number in a response can't be
+    used as positive proof — a 4-digit number coincides with prices, IDs,
+    timestamps, and a calculator MCP returns it *by design*.
+
+    Regression: ses-959cbb9f — ``mcp-server-calculator`` got a CRITICAL R2
+    RCE finding because evaluating ``1337*7`` is what it's supposed to do.
+    """
+    from mcp_dynamic_analyzer.payloads.rce import looks_like_rce_success
+    # Bare math result must not fire.
+    assert looks_like_rce_success('{"content":[{"type":"text","text":"9359"}]}') is False
+    # The unique canary still does.
+    assert looks_like_rce_success("Output: RCE_CANARY_7f3a9c") is True
+
+
+def test_python_parser_error_is_not_sql_leak() -> None:
+    """Python's ``SyntaxError`` and ``tokenize.TokenError`` both produce
+    ``unterminated string literal`` / ``SyntaxError: invalid syntax``
+    when a non-SQL tool runs ``ast.parse`` / ``eval`` on string input.
+    These must NOT match SQL error indicators.
+
+    Regression: ses-959cbb9f — sending ``'`` to ``mcp-server-calculator``
+    returned ``Error executing tool calculate: unterminated string literal
+    (detected at line 1) (<unknown>, line 1)``, which matched the bare
+    indicators ``unterminated string`` and ``syntax error`` and produced
+    a CRITICAL R5 "SQL error leaked" finding on a Python-only stack with
+    no database in sight.
+    """
+    from mcp_dynamic_analyzer.payloads.sql_injection import looks_like_sql_error
+    py_errors = [
+        "Error executing tool calculate: unterminated string literal (detected at line 1) (<unknown>, line 1)",
+        "SyntaxError: invalid syntax",
+        "SyntaxError: unexpected EOF while parsing",
+        "Traceback (most recent call last):\n  File \"<stdin>\", line 1\nSyntaxError: unterminated string literal",
+    ]
+    for err in py_errors:
+        assert looks_like_sql_error(err) is False, f"FP on: {err!r}"
+    # Real SQL errors still detected.
+    sql_errors = [
+        "ERROR: syntax error at or near \"foo\"",
+        "You have an error in your SQL syntax; check the manual",
+        "ERROR: unterminated quoted string at or near \"'\"",
+        "Unclosed quotation mark after the character string 'admin",
+        "SQL syntax error: missing FROM clause",
+    ]
+    for err in sql_errors:
+        assert looks_like_sql_error(err) is True, f"FN on: {err!r}"

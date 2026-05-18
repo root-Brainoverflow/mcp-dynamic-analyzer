@@ -210,8 +210,22 @@ class StdioInterceptor:
                 self._dispatch(msg)
         except asyncio.CancelledError:
             raise
-        except Exception:
-            log.exception("interceptor.read_loop_error")
+        except Exception as exc:
+            # NOTE: do NOT use ``log.exception`` here. structlog's rich
+            # traceback formatter recursively pretty-prints the exception's
+            # frame locals, which on this code path includes the offending
+            # server message ``msg``. If ``msg`` is what triggered the failure
+            # (a self-referencing JSON object that broke ``EventStore.write``,
+            # a circular response from a fuzzed tool, ...), rich's
+            # ``pretty.traverse`` recurses into the cycle and dies with its
+            # own ``RecursionError`` — drowning out the original error and
+            # crashing the orchestrator. A flat structured log keeps the
+            # diagnostic without inviting rich into the cycle.
+            log.warning(
+                "interceptor.read_loop_error",
+                error=str(exc)[:300],
+                error_type=type(exc).__name__,
+            )
         finally:
             exc = ServerCrashError("server stream ended") if self.server_died else ConnectionError("server stream ended")
             for fut in self._pending.values():

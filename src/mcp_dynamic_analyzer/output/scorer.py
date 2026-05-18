@@ -24,6 +24,16 @@ _SEVERITY_WEIGHT: dict[Severity, float] = {
 _NORMALISER = 2.0  # raw score of 2.0 → normalised 1.0
 
 
+def _is_caveat(f: Finding) -> bool:
+    """A caveat finding (e.g. "Scan coverage incomplete — server needs X")
+    reports a *gap in what could be tested*, not a measured risk. It is
+    excluded from the risk-score summation; its only effect on the verdict
+    is the APPROVE→CONDITIONAL bump below — so missing coverage can never
+    masquerade as a clean pass, but it also can't inflate a real verdict
+    (e.g. push CONDITIONAL→REJECT) by being added to the sum."""
+    return "coverage incomplete" in f.title.lower()
+
+
 class Scorer:
     """Compute per-risk-type and overall scores from a findings list."""
 
@@ -31,6 +41,8 @@ class Scorer:
         per_risk: dict[str, float] = {rt.value: 0.0 for rt in RiskType}
 
         for f in findings:
+            if _is_caveat(f):
+                continue
             weight = _SEVERITY_WEIGHT.get(f.severity, 0.0)
             raw = weight * f.confidence
             per_risk[f.risk_type.value] += raw
@@ -45,6 +57,17 @@ class Scorer:
             verdict = "CONDITIONAL"
         else:
             verdict = "APPROVE"
+
+        # A scan that couldn't exercise a meaningful chunk of the server (a
+        # missing runtime prerequisite the sandbox couldn't auto-install) is by
+        # definition partial — never let it read as a clean APPROVE. Downgrade
+        # to CONDITIONAL so the *top-line* verdict honestly says "incomplete";
+        # the LOW caveat finding carries the what/why/how. (A would-be REJECT
+        # stays REJECT — partial coverage doesn't make a bad result less bad.
+        # And the caveat's weight is excluded from the sum above, so it never
+        # pushes CONDITIONAL→REJECT.)
+        if verdict == "APPROVE" and any(_is_caveat(f) for f in findings):
+            verdict = "CONDITIONAL"
 
         return ScoringResult(
             per_risk=normalised,
